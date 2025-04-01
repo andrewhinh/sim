@@ -172,3 +172,14 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# config
+.vscode
+.env.*
+
+# FastHTML
+.sesskey
+Python-Antivirus
+
+# windsurf rules
+.windsurfrules
