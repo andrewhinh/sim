@@ -4,4 +4,14 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "alembic>=1.15.2",
+    "modal>=0.73.138",
+    "psycopg2>=2.9.10",
+    "python-dotenv>=1.1.0",
+    "python-fasthtml>=0.12.9",
+    "simpleicons>=7.21.0",
+    "sqlmodel>=0.0.24",
+    "starlette>=0.46.1",
+    "stripe>=11.6.0",
+]

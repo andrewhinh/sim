@@ -52,11 +52,11 @@ DOMAIN=
 Migrate db (do before running the frontend/api):
 
 ```bash
-export ENV={env}
-export MSG={message}
-uv run alembic -x env=$(ENV) -c db/migrations/alembic.ini stamp head
-uv run alembic -x env=$(ENV) -c db/migrations/alembic.ini revision --autogenerate -m "$(MSG)" --version-path db/migrations/versions/$(ENV)
-uv run alembic -x env=$(ENV) -c db/migrations/alembic.ini upgrade head
+export ENV=dev  # or prod
+export MSG="your migration message"
+uv run alembic -x env=$ENV -c db/migrations/alembic.ini stamp head
+uv run alembic -x env=$ENV -c db/migrations/alembic.ini revision --autogenerate -m "$MSG" --version-path db/migrations/versions/$ENV
+uv run alembic -x env=$ENV -c db/migrations/alembic.ini upgrade head
 ```
 
 ### Repository Structure
