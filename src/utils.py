@@ -60,6 +60,11 @@ IMAGE = (
     modal.Image.debian_slim(PYTHON_VERSION)
     .apt_install("git", "libpq-dev")  # add system dependencies
     .pip_install(*PYPROJECT_DEPS)  # add Python dependencies
+    .run_commands(
+        [
+            "git clone https://github.com/Len-Stevens/Python-Antivirus.git /root/Python-Antivirus"
+        ]
+    )
     .add_local_file(PARENT_PATH / "favicon.ico", "/root/favicon.ico")
     .add_local_file(PARENT_PATH / "logo.png", "/root/logo.png")
     .add_local_file(PARENT_PATH / "pyproject.toml", "/root/pyproject.toml")
