@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import random
 import smtplib
 import ssl
 import subprocess
@@ -12,19 +13,24 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import modal
 import stripe
+import torch
+from dotenv import load_dotenv
 from fasthtml import common as fh
 from fasthtml.oauth import GitHubAppClient, GoogleAppClient, redir_url
 from passlib.hash import pbkdf2_sha256
 from PIL import Image
+from pydantic import BaseModel
 from simpleicons.icons import si_github
 from sqlmodel import Session as DBSession
 from sqlmodel import create_engine, select
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse
+from vllm import LLM, SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
 
 from db.models import (
     GlobalBalance,
@@ -34,26 +40,300 @@ from db.models import (
     UserRead,
     init_balance,
 )
-from src.utils import (
-    APP_NAME,
-    DEFAULT_USER_PROMPTS,
-    IMAGE,
-    MINUTES,
-    PARENT_PATH,
-    SECRETS,
-)
+
+# seed
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+
+# paths
+PARENT_PATH = Path(__file__).parent.parent
+DB_SRC_PATH = PARENT_PATH / "db"
+SRC_PATH = PARENT_PATH / "src"
 
 # -----------------------------------------------------------------------------
 
 # Modal
+APP_NAME = "sim"
+IN_PROD = os.getenv("MODAL_ENVIRONMENT", "dev") == "main"
+load_dotenv(".env" if IN_PROD else ".env.local" if modal.is_local() else ".env.dev")
+SECRETS = [
+    modal.Secret.from_dotenv(
+        path=PARENT_PATH,
+        filename=".env"
+        if IN_PROD
+        else ".env.local"
+        if modal.is_local()
+        else ".env.dev",
+    )
+]
+
+MINUTES = 60  # seconds
 CPU = 8  # cores
 MEM = 32768  # MB
+PYTHON_VERSION = "3.12"
 
-TIMEOUT = 5 * MINUTES  # max
-SCALEDOWN_WINDOW = 15 * MINUTES  # max
-ALLOW_CONCURRENT_INPUTS = 1000  # max
+## frontend
+FE_IMAGE = (
+    modal.Image.debian_slim(PYTHON_VERSION)
+    .apt_install("git", "libpq-dev")  # add system dependencies
+    .pip_install(
+        "alembic>=1.15.2",
+        "passlib>=1.7.4",
+        "pillow>=11.1.0",
+        "psycopg2>=2.9.10",
+        "python-fasthtml>=0.12.9",
+        "simpleicons>=7.21.0",
+        "sqlmodel>=0.0.24",
+        "starlette>=0.46.1",
+        "stripe>=11.6.0",
+    )  # add Python dependencies
+    .run_commands(
+        [
+            "git clone https://github.com/Len-Stevens/Python-Antivirus.git /root/Python-Antivirus"
+        ]
+    )
+    .add_local_file(PARENT_PATH / "favicon.ico", "/root/favicon.ico")
+    .add_local_file(PARENT_PATH / "logo.png", "/root/logo.png")
+    .add_local_file(PARENT_PATH / "pyproject.toml", "/root/pyproject.toml")
+)
+
+## gpu
+CUDA_VERSION = "12.8.0"
+FLAVOR = "devel"
+OS = "ubuntu22.04"
+TAG = f"nvidia/cuda:{CUDA_VERSION}-{FLAVOR}-{OS}"
+
+PRETRAINED_VOLUME = f"{APP_NAME}-pretrained"
+VOLUME_CONFIG: dict[str | PurePosixPath, modal.Volume] = {
+    f"/{PRETRAINED_VOLUME}": modal.Volume.from_name(
+        PRETRAINED_VOLUME, create_if_missing=True
+    ),
+}
+
+GPU_IMAGE = (
+    modal.Image.from_registry(TAG, add_python=PYTHON_VERSION)
+    .apt_install("git")
+    .pip_install(
+        "accelerate>=1.6.0",
+        "flashinfer-python==0.2.2.post1",
+        "hf-transfer>=0.1.9",
+        "huggingface-hub>=0.30.2",
+        "ninja>=1.11.1.4",  # required to build flash-attn
+        "packaging>=24.2",  # required to build flash-attn
+        "torch>=2.6.0",
+        "tqdm>=4.67.1",
+        "transformers>=4.51.1",
+        "vllm>=0.8.3",
+        "wheel>=0.45.1",  # required to build flash-attn
+    )
+    .run_commands("pip install flash-attn==2.7.4.post1 --no-build-isolation")
+    .env(
+        {
+            "TOKENIZERS_PARALLELISM": "false",
+            "HUGGINGFACE_HUB_CACHE": f"/{PRETRAINED_VOLUME}",
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        }
+    )
+    .add_local_python_source("src", copy=True)
+)
 
 app = modal.App(f"{APP_NAME}-frontend")
+
+# -----------------------------------------------------------------------------
+
+# helper GPU functions
+
+
+class CheckedInput(BaseModel):
+    suggestions: list[str] | None
+
+
+global small_llm, check_sampling_params, modify_sampling_params
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    gpu="l40s:1",
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+    allow_concurrent_inputs=1000,
+)
+def check_question_threaded(question: str) -> CheckedInput:
+    max_num_suggestions = 3
+
+    system_prompt = """
+    You are a research methodology expert. Your ONLY task is to evaluate research questions and return a JSON response in the EXACT format specified.
+    """
+    user_prompt = f"""
+    Question to evaluate: "{question}"
+
+    First, check if this question meets ALL these criteria:
+    1. CLARITY: Specific, focused, and narrow enough to answer thoroughly
+    2. FEASIBILITY: Can be answered with available resources and time
+    3. ANALYTICAL: Requires analysis rather than simple yes/no answers
+    4. ETHICAL: Follows proper research ethics protocols
+
+    If ALL criteria are met, your response must be EXACTLY:
+    {{
+        "suggestions": null,
+    }}
+    If ANY criteria are NOT met, your response must include THREE OR LESS single-word suggestions (choose from the list below):
+    - Specificity
+    - Scope
+    - Population
+    - Variables
+    - Timeframe
+    - Resources
+    - Methods
+    - Sample
+    - Causality
+    - Comparison
+    - Factors
+    - Ethics
+    - Consent
+    - Privacy
+
+    Format your response EXACTLY like this (no other text):
+    {{
+        "suggestions": ["Word1", "Word2", "Word3"],
+    }}
+    """
+
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    processor = "Qwen/Qwen2.5-0.5B-Instruct"
+    # quantization = None  # "awq_marlin"
+    # kv_cache_dtype = None  # "fp8_e5m2"
+    enforce_eager = True
+    max_num_seqs = 1
+    max_model_len = 2048
+
+    temperature = 0.7
+    top_p = 0.8
+    repetition_penalty = 1.05
+    stop_token_ids = []
+    max_tokens = 512
+    guided_decoding = GuidedDecodingParams(json=CheckedInput.model_json_schema())
+
+    global small_llm, check_sampling_params
+    if "small_llm" not in globals():
+        small_llm = LLM(
+            model=model_name,
+            tokenizer=processor,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel_size=torch.cuda.device_count(),
+            trust_remote_code=True,
+            max_model_len=max_model_len,
+        )
+    if "check_sampling_params" not in globals():
+        check_sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+            guided_decoding=guided_decoding,
+        )
+
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
+        ]
+    ]
+    outputs = small_llm.chat(conversations, check_sampling_params, use_tqdm=True)
+    generated_text = outputs[0].outputs[0].text.strip()
+    response_dict = json.loads(generated_text)
+    response = CheckedInput.model_validate(response_dict)
+    response.suggestions = response.suggestions[:max_num_suggestions]
+    return response
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    gpu="l40s:1",
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+    allow_concurrent_inputs=1000,
+)
+def modify_question_threaded(question: str, suggestion: str) -> str:
+    system_prompt = """
+    You are a research methodology expert. Your ONLY task is to evaluate research questions and return a modified question in the EXACT format specified.
+    """
+    user_prompt = f"""
+    Question to modify: "{question}"
+
+    Incorporate the suggestion "{suggestion}" to make the question "{question}" a good research question.
+
+    A good research question meets ALL these criteria:
+    1. CLARITY: Specific, focused, and narrow enough to answer thoroughly
+    2. FEASIBILITY: Can be answered with available resources and time
+    3. ANALYTICAL: Requires analysis rather than simple yes/no answers
+    4. ETHICAL: Follows proper research ethics protocols
+
+    Finally, simply return the new research question.
+    """
+
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    processor = "Qwen/Qwen2.5-0.5B-Instruct"
+    # quantization = None  # "awq_marlin"
+    # kv_cache_dtype = None  # "fp8_e5m2"
+    enforce_eager = True
+    max_num_seqs = 1
+    max_model_len = 2048
+
+    temperature = 0.7
+    top_p = 0.8
+    repetition_penalty = 1.05
+    stop_token_ids = []
+    max_tokens = 512
+
+    global small_llm, modify_sampling_params
+    if "small_llm" not in globals():
+        small_llm = LLM(
+            model=model_name,
+            tokenizer=processor,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel_size=torch.cuda.device_count(),
+            trust_remote_code=True,
+            max_model_len=max_model_len,
+        )
+    if "modify_sampling_params" not in globals():
+        modify_sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+        )
+
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
+        ]
+    ]
+    outputs = small_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
+    generated_text = outputs[0].outputs[0].text.strip()
+    return generated_text
+
 
 # -----------------------------------------------------------------------------
 
@@ -162,6 +442,22 @@ def get_app():  # noqa: C901
             fh.HighlightJS(langs=["python", "javascript", "html", "css"]),
             fh.Link(rel="icon", href="/favicon.ico", type="image/x-icon"),
             fh.Script(src="https://unpkg.com/htmx-ext-sse@2.2.1/sse.js"),
+            fh.Style("""
+            .hide-when-loading {
+                display: inline-block;
+            }
+            .htmx-request.hide-when-loading,
+            .htmx-request .hide-when-loading {
+                display: none;
+            }
+            .indicator {
+                display: none;
+            }
+            .htmx-request.indicator,
+            .htmx-request .indicator {
+                display: inline-block;
+            }
+            """),
         ],
         boost=True,
     )
@@ -218,6 +514,13 @@ def get_app():  # noqa: C901
         os.getenv("GITHUB_CLIENT_ID"), os.getenv("GITHUB_CLIENT_SECRET")
     )
 
+    # default questions
+    default_question_pairs = {
+        "keto and gum disease": "What is the relationship between adherence to a ketogenic diet and the prevalence of periodontal disease among adults aged 30-50?",
+        "fasting and cognition": "How does intermittent fasting affect cognitive performance and memory function in healthy adults over a 12-week period?",
+        "CV health and exercise intensity": "To what extent does high-intensity interval training versus moderate continuous exercise impact cardiovascular health markers in sedentary middle-aged individuals?",
+    }
+
     # layout
     def nav(session, show_auth=True):
         curr_user = get_curr_user(session)
@@ -235,43 +538,6 @@ def get_app():  # noqa: C901
                     href="/",
                     cls=f"flex justify-center items-center gap-2 hover:{img_hover} hover:text-{text_hover_color}",
                 ),
-            ),
-            fh.Svg(
-                fh.NotStr(
-                    """<style>
-                    .spinner_zWVm { animation: spinner_5QiW 1.2s linear infinite, spinner_PnZo 1.2s linear infinite; }
-                    .spinner_gfyD { animation: spinner_5QiW 1.2s linear infinite, spinner_4j7o 1.2s linear infinite; animation-delay: .1s; }
-                    .spinner_T5JJ { animation: spinner_5QiW 1.2s linear infinite, spinner_fLK4 1.2s linear infinite; animation-delay: .1s; }
-                    .spinner_E3Wz { animation: spinner_5QiW 1.2s linear infinite, spinner_tDji 1.2s linear infinite; animation-delay: .2s; }
-                    .spinner_g2vs { animation: spinner_5QiW 1.2s linear infinite, spinner_CMiT 1.2s linear infinite; animation-delay: .2s; }
-                    .spinner_ctYB { animation: spinner_5QiW 1.2s linear infinite, spinner_cHKR 1.2s linear infinite; animation-delay: .2s; }
-                    .spinner_BDNj { animation: spinner_5QiW 1.2s linear infinite, spinner_Re6e 1.2s linear infinite; animation-delay: .3s; }
-                    .spinner_rCw3 { animation: spinner_5QiW 1.2s linear infinite, spinner_EJmJ 1.2s linear infinite; animation-delay: .3s; }
-                    .spinner_Rszm { animation: spinner_5QiW 1.2s linear infinite, spinner_YJOP 1.2s linear infinite; animation-delay: .4s; }
-                    @keyframes spinner_5QiW { 0%, 50% { width: 7.33px; height: 7.33px; } 25% { width: 1.33px; height: 1.33px; } }
-                    @keyframes spinner_PnZo { 0%, 50% { x: 1px; y: 1px; } 25% { x: 4px; y: 4px; } }
-                    @keyframes spinner_4j7o { 0%, 50% { x: 8.33px; y: 1px; } 25% { x: 11.33px; y: 4px; } }
-                    @keyframes spinner_fLK4 { 0%, 50% { x: 1px; y: 8.33px; } 25% { x: 4px; y: 11.33px; } }
-                    @keyframes spinner_tDji { 0%, 50% { x: 15.66px; y: 1px; } 25% { x: 18.66px; y: 4px; } }
-                    @keyframes spinner_CMiT { 0%, 50% { x: 8.33px; y: 8.33px; } 25% { x: 11.33px; y: 11.33px; } }
-                    @keyframes spinner_cHKR { 0%, 50% { x: 1px; y: 15.66px; } 25% { x: 4px; y: 18.66px; } }
-                    @keyframes spinner_Re6e { 0%, 50% { x: 15.66px; y: 8.33px; } 25% { x: 18.66px; y: 11.33px; } }
-                    @keyframes spinner_EJmJ { 0%, 50% { x: 8.33px; y: 15.66px; } 25% { x: 11.33px; y: 18.66px; } }
-                    @keyframes spinner_YJOP { 0%, 50% { x: 15.66px; y: 15.66px; } 25% { x: 18.66px; y: 18.66px; } }
-                </style>
-                <rect class="spinner_zWVm" x="1" y="1" width="7.33" height="7.33"/>
-                <rect class="spinner_gfyD" x="8.33" y="1" width="7.33" height="7.33"/>
-                <rect class="spinner_T5JJ" x="1" y="8.33" width="7.33" height="7.33"/>
-                <rect class="spinner_E3Wz" x="15.66" y="1" width="7.33" height="7.33"/>
-                <rect class="spinner_g2vs" x="8.33" y="8.33" width="7.33" height="7.33"/>
-                <rect class="spinner_ctYB" x="1" y="15.66" width="7.33" height="7.33"/>
-                <rect class="spinner_BDNj" x="15.66" y="8.33" width="7.33" height="7.33"/>
-                <rect class="spinner_rCw3" x="8.33" y="15.66" width="7.33" height="7.33"/>
-                <rect class="spinner_Rszm" x="15.66" y="15.66" width="7.33" height="7.33"/>
-                """
-                ),
-                id="spinner",
-                cls=f"htmx-indicator w-10 h-10 object-contain absolute top-6 left-1/2 transform -translate-x-1/2 fill-{click_color}",
             ),
             fh.Div(
                 fh.A(
@@ -311,25 +577,72 @@ def get_app():  # noqa: C901
         return fh.Main(
             fh.Form(
                 fh.Textarea(
-                    id="user-prompt",
-                    name="user_prompt",
+                    id="question",
                     placeholder="Ask a research question...",
                     rows=10,
-                    cls=f"{input_cls} p-4 resize-none",
                     autofocus=True,
-                    onkeydown="if(event.key === 'Enter' && event.shiftKey) { this.form.submit(); event.preventDefault(); }",
+                    hx_post="/check-question",
+                    hx_target="#check-results",
+                    hx_swap="outerHTML",
+                    hx_trigger="change, keyup delay:200ms changed",
+                    hx_indicator="#check-results, #check-loader",
+                    hx_disabled_elt="#question-form-button",
+                    cls=f"{input_cls} p-4 resize-none",
+                ),
+                fh.Div(id="new-textarea-content", cls="hidden"),
+                fh.Div(
+                    fh.Div(
+                        id="check-results",
+                        hx_swap_oob="true",
+                        cls="hide-when-loading",
+                    ),
+                    fh.Div(
+                        fh.Img(
+                            src="/spinner.svg",
+                            cls="indicator w-6 h-6 object-contain",
+                        ),
+                        fh.P(
+                            "Evaluating question strength...",
+                            cls=f"indicator text-{text_color}",
+                        ),
+                        id="check-loader",
+                        cls="indicator flex justify-center items-center",
+                    ),
+                    fh.Div(
+                        fh.Img(
+                            src="/spinner.svg",
+                            cls="indicator w-6 h-6 object-contain",
+                        ),
+                        fh.P(
+                            "Modifying question...",
+                            cls=f"indicator text-{text_color}",
+                        ),
+                        id="modify-loader",
+                        cls="indicator flex justify-center items-center",
+                    ),
+                    cls="absolute bottom-2 left-2 p-2",
                 ),
                 fh.Button(
                     fh.P(
                         "→",
-                        cls=f"text-{text_color} hover:text-{text_button_hover_color}",
+                        id="question-form-button-text",
+                        cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                     ),
+                    fh.Img(
+                        src="/spinner.svg",
+                        id="question-form-loader",
+                        cls="indicator w-6 h-6 object-contain",
+                    ),
+                    id="question-form-button",
                     type="submit",
                     cls=f"absolute bottom-0 right-4 rounded-full p-2 {click_button}",
                     style="width: 3rem; height: 3rem;",
                 ),
+                id="question-form",
                 hx_post="/",
-                hx_indicator="#spinner",
+                hx_trigger="keyup[shiftKey&&key=='Enter'] from:body",
+                hx_indicator="#question-form-button-text, #question-form-loader",
+                hx_disabled_elt="#question, #question-form-button",
                 cls="w-full md:w-2/3 relative flex justify-between items-center",
             ),
             fh.Div(
@@ -342,19 +655,17 @@ def get_app():  # noqa: C901
             fh.Div(
                 *[
                     fh.Button(
-                        prompt,
+                        question,
                         cls=f"{click_button} px-4 py-2 {rounded}",
-                        hx_post="/fill-user-prompt",
-                        hx_indicator="#spinner",
-                        hx_target="#user-prompt",
-                        hx_swap="innerHTML",
+                        hx_post="/fill-question",
+                        hx_target="#new-textarea-content",
                         hx_vals=json.dumps(
                             {
-                                "prompt": prompt,
+                                "question": question,
                             }
                         ),
                     )
-                    for prompt in DEFAULT_USER_PROMPTS
+                    for question in default_question_pairs.keys()
                 ],
                 cls="w-full md:w-2/3 flex flex-col md:flex-row justify-start items-start md:items-center gap-4",
             ),
@@ -442,15 +753,25 @@ def get_app():  # noqa: C901
                         cls=f"w-full {input_cls}",
                     ),
                     fh.Button(
-                        "Sign Up",
+                        fh.P(
+                            "Sign Up",
+                            id="signup-button-text",
+                            cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                        ),
+                        fh.Img(
+                            src="/spinner.svg",
+                            id="signup-loader",
+                            cls="indicator w-10 h-10 object-contain",
+                        ),
+                        id="signup-button",
                         type="submit",
                         cls=f"w-full {click_button} p-3 {rounded}",
                     ),
                     hx_post="/signup",
-                    hx_indicator="#spinner",
                     hx_target="this",
                     hx_swap="none",
-                    onkeydown="if(event.key === 'Enter') { this.form.submit(); event.preventDefault(); }",
+                    hx_indicator="#signup-button-text, #signup-loader",
+                    hx_disabled_elt="#email, #password, #signup-button",
                     cls="w-full",
                 ),
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
@@ -539,15 +860,25 @@ def get_app():  # noqa: C901
                         cls=f"w-full {input_cls}",
                     ),
                     fh.Button(
-                        "Log In",
+                        fh.P(
+                            "Log In",
+                            id="login-button-text",
+                            cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                        ),
+                        fh.Img(
+                            src="/spinner.svg",
+                            id="login-loader",
+                            cls="indicator w-10 h-10 object-contain",
+                        ),
+                        id="login-button",
                         type="submit",
                         cls=f"w-full {click_button} p-3 {rounded}",
                     ),
                     hx_post="/login",
-                    hx_indicator="#spinner",
                     hx_target="this",
                     hx_swap="none",
-                    onkeydown="if(event.key === 'Enter') { this.form.submit(); event.preventDefault(); }",
+                    hx_indicator="#login-button-text, #login-loader",
+                    hx_disabled_elt="#email, #password, #login-button",
                     cls="w-full",
                 ),
                 fh.Div(
@@ -580,21 +911,33 @@ def get_app():  # noqa: C901
                     cls=f"text-{text_color} text-center",
                 ),
                 fh.Input(
+                    id="email",
                     type="email",
                     name="email",
                     placeholder="Email",
+                    required=True,
                     cls=f"w-full {input_cls}",
                 ),
                 fh.Button(
-                    "Send Reset Link",
+                    fh.P(
+                        "Send Reset Link",
+                        id="forgot-password-button-text",
+                        cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                    ),
+                    fh.Img(
+                        src="/spinner.svg",
+                        id="forgot-password-loader",
+                        cls="indicator w-6 h-6 object-contain",
+                    ),
+                    id="forgot-password-button",
                     type="submit",
                     cls=f"w-full {click_button} p-3 {rounded}",
                 ),
                 hx_post="/forgot-password",
                 hx_target="this",
                 hx_swap="none",
-                hx_indicator="#spinner",
-                onkeydown="if(event.key === 'Enter') { this.form.submit(); event.preventDefault(); }",
+                hx_indicator="#forgot-password-button-text, #forgot-password-loader",
+                hx_disabled_elt="#email, #forgot-password-button",
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
             ),
             cls=page_ctnt,
@@ -620,6 +963,7 @@ def get_app():  # noqa: C901
                     cls=f"text-{text_color} text-center",
                 ),
                 fh.Input(
+                    id="password",
                     name="password",
                     placeholder="New Password",
                     type="password",
@@ -627,6 +971,7 @@ def get_app():  # noqa: C901
                     cls=f"w-full {input_cls}",
                 ),
                 fh.Input(
+                    id="confirm_password",
                     name="confirm_password",
                     placeholder="Confirm Password",
                     type="password",
@@ -641,15 +986,25 @@ def get_app():  # noqa: C901
                 if token
                 else "",
                 fh.Button(
-                    "Reset Password",
+                    fh.P(
+                        "Reset Password",
+                        id="reset-password-button-text",
+                        cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                    ),
+                    fh.Img(
+                        src="/spinner.svg",
+                        id="reset-password-loader",
+                        cls="indicator w-10 h-10 object-contain",
+                    ),
+                    id="reset-password-button",
                     type="submit",
                     cls=f"w-full {click_button} p-3 {rounded}",
                 ),
                 hx_post="/reset-password",
                 hx_target="this",
                 hx_swap="none",
-                hx_indicator="#spinner",
-                onkeydown="if(event.key === 'Enter') { this.form.submit(); event.preventDefault(); }",
+                hx_indicator="#reset-password-button-text, #reset-password-loader",
+                hx_disabled_elt="#password, #confirm_password, #reset-password-button",
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
             ),
             cls=page_ctnt,
@@ -679,11 +1034,21 @@ def get_app():  # noqa: C901
                                 cls="w-12 h-12 object-cover rounded-full",
                             ),
                             fh.Button(
-                                "Edit",
+                                fh.P(
+                                    "Edit",
+                                    id="edit-button-text",
+                                    cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                                ),
+                                fh.Img(
+                                    src="/spinner.svg",
+                                    id="edit-loader",
+                                    cls="indicator w-6 h-6 object-contain",
+                                ),
                                 hx_get="/settings/edit",
-                                hx_indicator="#spinner",
                                 hx_target="#settings",
                                 hx_swap="outerHTML",
+                                hx_indicator="#edit-button-text, #edit-loader",
+                                hx_disabled_elt="#edit-button",
                                 cls=f"max-w-28 md:max-w-48 flex grow justify-center items-center {click_button} {rounded} p-3",
                             ),
                             cls="w-full flex justify-between items-center",
@@ -731,10 +1096,20 @@ def get_app():  # noqa: C901
                         cls="w-full flex flex-col justify-between items-center gap-4",
                     ),
                     fh.Button(
-                        "Delete Account",
+                        fh.P(
+                            "Delete Account",
+                            id="delete-account-button-text",
+                            cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                        ),
+                        fh.Img(
+                            src="/spinner.svg",
+                            id="delete-account-loader",
+                            cls="indicator w-6 h-6 object-contain",
+                        ),
                         hx_delete="/settings/delete-account",
                         hx_confirm="Are you sure you want to delete your account? This action cannot be undone.",
-                        hx_indicator="#spinner",
+                        hx_indicator="#delete-account-button-text, #delete-account-loader",
+                        hx_disabled_elt="#delete-account-button",
                         cls=f"w-full flex justify-center items-center {click_danger_button} {rounded} p-3",
                     ),
                     cls="w-full flex flex-col justify-center items-center gap-4",
@@ -1047,10 +1422,10 @@ def get_app():  # noqa: C901
                     cls=f"text-{text_color} hover:text-{text_hover_color} hidden md:block",
                 ),
                 hx_get="/user/overlay/close",
-                hx_trigger="click",
                 hx_target="#overlay",
                 hx_swap="outerHTML",
-                hx_indicator="#spinner",
+                hx_trigger="click",
+                hx_disabled_elt="#overlay",
                 cls=f"flex justify-center items-center gap-2 cursor-pointer hover:{img_hover} hover:text-{text_hover_color}",
             ),
             fh.Div(
@@ -1063,10 +1438,20 @@ def get_app():  # noqa: C901
                     cls="w-full",
                 ),
                 fh.Button(
-                    "Log out",
+                    fh.P(
+                        "Log out",
+                        id="logout-button-text",
+                        cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                    ),
+                    fh.Img(
+                        src="/spinner.svg",
+                        id="logout-loader",
+                        cls="indicator w-10 h-10 object-contain",
+                    ),
                     cls=f"w-full {click_button} {rounded} p-3",
                     hx_get="/logout",
-                    hx_indicator="#spinner",
+                    hx_indicator="#logout-button-text, #logout-loader",
+                    hx_disabled_elt="#logout-button",
                 ),
                 cls=f"absolute top-14 right-0 min-w-40 z-10 flex flex-col justify-center items-center gap-2 {input_cls} p-2",
             ),
@@ -1091,12 +1476,12 @@ def get_app():  # noqa: C901
                 cls=f"text-{text_color} hover:text-{text_hover_color} hidden md:block",
             ),
             id="overlay",
-            hx_swap_oob="true",
             hx_get="/user/overlay/show",
-            hx_trigger="click",
             hx_target="#overlay",
             hx_swap="outerHTML",
-            hx_indicator="#spinner",
+            hx_trigger="click",
+            hx_disabled_elt="#overlay",
+            hx_swap_oob="true",
             cls=f"flex justify-center items-center gap-2 cursor-pointer hover:{img_hover} hover:text-{text_hover_color}",
         )
 
@@ -1109,13 +1494,71 @@ def get_app():  # noqa: C901
         )
 
     ### fill user prompt
-    @f_app.post("/fill-user-prompt")
-    def fill_user_prompt(session, prompt: str):
-        return prompt
+    @f_app.post("/fill-question")
+    def fill_question(session, question: str):
+        return fh.Script(f"""
+            document.getElementById('question').value = "{default_question_pairs.get(question)}";
+        """)
+
+    ### input validation
+    @f_app.post("/check-question")
+    def check_question(session, question: str):
+        checked_input = (
+            check_question_threaded.local(question)
+            if modal.is_local()
+            else check_question_threaded.remote(question)
+        )
+        return (
+            fh.Div(
+                "Good question!",
+                id="check-results",
+                cls=f"hide-when-loading text-{click_color}",
+            )
+            if not checked_input.suggestions
+            else fh.Div(
+                *[
+                    fh.Button(
+                        suggestion,
+                        hx_post="/modify-question",
+                        hx_target="#new-textarea-content",
+                        hx_indicator="#check-results, #modify-loader",
+                        hx_disabled_elt="#question-form-button",
+                        hx_vals=json.dumps(
+                            {
+                                "question": question,
+                                "suggestion": suggestion,
+                            }
+                        ),
+                        cls=f"{click_neutral_button} px-4 py-2 {rounded}",
+                    )
+                    for suggestion in checked_input.suggestions
+                ],
+                id="check-results",
+                cls="hide-when-loading w-full md:w-2/3 flex flex-col md:flex-row justify-start items-start md:items-center gap-4",
+            ),
+        )
+
+    @f_app.post("/modify-question")
+    def modify_question(session, question: str, suggestion: str):
+        new_question = (
+            modify_question_threaded.local(question, suggestion)
+            if modal.is_local()
+            else modify_question_threaded.remote(question, suggestion)
+        )
+        return (
+            fh.Script(f"""
+            document.getElementById('question').value = "{new_question}";
+        """),
+            fh.Div(
+                id="check-results",
+                hx_swap_oob="true",
+                cls="hide-when-loading",
+            ),
+        )
 
     ### sim trial
     # @f_app.post("/")
-    # def sim_trial(session, user_prompt: str):
+    # def sim_trial(session, question: str):
     #     pass
 
     ## auth
@@ -1338,25 +1781,41 @@ def get_app():  # noqa: C901
                             type="file",
                             accept="image/*",
                             hx_post="/update-preview",
-                            hx_trigger="change delay:200ms changed",
-                            hx_target="#profile-image-preview",
+                            hx_target="#profile-img-preview",
                             hx_swap="outerHTML",
-                            hx_indicator="#spinner",
+                            hx_trigger="change delay:200ms changed",
+                            hx_indicator="#profile-img-preview, #profile-img-loader",
+                            hx_disabled_elt="#new-profile-img-upload",
                             hx_encoding="multipart/form-data",
                             cls="hidden",
                         ),
                         fh.Img(
                             src=curr_user.profile_img,
-                            cls=f"w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
-                            id="profile-image-preview",
+                            cls=f"hide-when-loading w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
+                            id="profile-img-preview",
+                        ),
+                        fh.Img(
+                            src="/spinner.svg",
+                            id="profile-img-loader",
+                            cls="indicator w-12 h-12 object-contain",
                         ),
                     ),
                     fh.Button(
-                        "Save",
+                        fh.P(
+                            "Save",
+                            id="save-button-text",
+                            cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
+                        ),
+                        fh.Img(
+                            src="/spinner.svg",
+                            id="save-loader",
+                            cls="indicator w-6 h-6 object-contain",
+                        ),
                         hx_patch="/settings/save",
-                        hx_indicator="#spinner",
                         hx_target="#settings",
                         hx_swap="outerHTML",
+                        hx_indicator="#save-button-text, #save-loader",
+                        hx_disabled_elt="#new-profile-img-upload, #email, #username, #password, #save-button",
                         hx_include="#new-profile-img-upload",
                         hx_encoding="multipart/form-data",
                         cls=f"max-w-28 md:max-w-48 flex grow justify-center items-center {click_button} {rounded} p-3",
@@ -1366,6 +1825,7 @@ def get_app():  # noqa: C901
                 fh.Div(
                     fh.P("Email:", cls=f"text-{text_color}"),
                     fh.Input(
+                        id="email",
                         value=curr_user.email,
                         name="email",
                         type="email",
@@ -1376,6 +1836,7 @@ def get_app():  # noqa: C901
                 fh.Div(
                     fh.P("Username:", cls=f"text-{text_color}"),
                     fh.Input(
+                        id="username",
                         value=curr_user.username,
                         name="username",
                         cls=f"max-w-28 md:max-w-48 flex grow justify-center items-center {input_cls}",
@@ -1385,6 +1846,7 @@ def get_app():  # noqa: C901
                 fh.Div(
                     fh.P("Password:", cls=f"text-{text_color}"),
                     fh.Input(
+                        id="password",
                         value="",
                         name="password",
                         type="password",
@@ -1412,14 +1874,14 @@ def get_app():  # noqa: C901
                 fh.Img(
                     src=curr_user.profile_img,
                     cls=f"w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
-                    id="profile-image-preview",
+                    id="profile-img-preview",
                 ),
             )
         return (
             fh.Img(
                 src=f"data:image/png;base64,{res['success']}",
                 cls=f"w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
-                id="profile-image-preview",
+                id="profile-img-preview",
             ),
         )
 
@@ -1575,13 +2037,13 @@ f_app = get_app()
 
 
 @app.function(
-    image=IMAGE,
+    image=FE_IMAGE,
     cpu=CPU,
     memory=MEM,
     secrets=SECRETS,
-    timeout=TIMEOUT,
-    scaledown_window=SCALEDOWN_WINDOW,
-    allow_concurrent_inputs=ALLOW_CONCURRENT_INPUTS,
+    timeout=5 * MINUTES,
+    scaledown_window=15 * MINUTES,
+    allow_concurrent_inputs=1000,
 )
 @modal.asgi_app()
 def modal_get():

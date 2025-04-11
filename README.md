@@ -14,7 +14,7 @@ Set up the environment:
 make setup
 ```
 
-Create a `.env` (+ `.env.dev`):
+Create a `.env` (+ `.env.dev` + `.env.local`):
 
 ```bash
 HF_TOKEN=
@@ -37,7 +37,6 @@ GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
-
 
 STRIPE_PUBLISHABLE_KEY=
 STRIPE_SECRET_KEY=
@@ -76,7 +75,6 @@ Serve the web app locally:
 ```bash
 uv run src/app.py
 stripe listen --forward-to <url>/webhook
-# update STRIPE_WEBHOOK_SECRET and DOMAIN in .env.dev
 ```
 
 Serve the web app on Modal:
@@ -84,14 +82,12 @@ Serve the web app on Modal:
 ```bash
 modal serve src/app.py
 stripe listen --forward-to <url>/webhook
-# update STRIPE_WEBHOOK_SECRET and DOMAIN in .env.dev
 ```
 
 Deploy on dev:
 
 ```bash
 modal deploy src/app.py
-# update STRIPE_WEBHOOK_SECRET and DOMAIN in .env.dev
 ```
 
 Deploy on main:

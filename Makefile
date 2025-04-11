@@ -3,6 +3,7 @@ setup:
 	uv run pre-commit install
 	modal setup
 	modal config set-environment dev
+	git clone https://github.com/Len-Stevens/Python-Antivirus.git
 	echo "alias modal='uv run modal'" >> ~/.bashrc
 	echo "export PYTHONPATH=.:$PYTHONPATH" >> ~/.bashrc
 	echo "export TOKENIZERS_PARALLELISM=false" >> ~/.bashrc
