@@ -9,7 +9,7 @@ from sqlmodel import SQLModel
 from db import models  # noqa: F401
 
 env = context.get_x_argument(as_dictionary=True).get("env", "dev")
-env_file = ".env" if env != "dev" else ".env.dev"
+env_file = ".env" if env == "main" else ".env.dev" if env == "dev" else ".env.local"
 load_dotenv(env_file)
 
 
@@ -73,7 +73,9 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        context.configure(
+            connection=connection, target_metadata=target_metadata, compare_type=True
+        )
 
         with context.begin_transaction():
             context.run_migrations()
