@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime
-from sqlmodel import Field, SQLModel
+
+from sqlalchemy import JSON, Column
+from sqlmodel import Field, Relationship, SQLModel
 
 # global balance
 init_balance = 100
@@ -22,6 +24,10 @@ class GlobalBalanceRead(GlobalBalanceBase):
     id: int
 
 
+class GlobalBalanceUpdate(SQLModel):
+    balance: int | None = None
+
+
 # user
 init_user_balance = 100
 
@@ -41,6 +47,8 @@ class User(UserBase, table=True):
     reset_token: str | None = Field(default=None)
     reset_token_expiry: datetime | None = Field(default=None)
 
+    trials: list["Trial"] = Relationship(back_populates="user", cascade_delete=True)
+
 
 class UserCreate(UserBase):
     password: str | None = Field()
@@ -55,3 +63,74 @@ class UserUpdate(SQLModel):
     profile_img: str | None = None
     email: str | None = None
     password: str | None = None
+
+
+# trial
+
+
+class TrialBase(SQLModel):
+    pass
+
+
+class Trial(TrialBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    uuid: str = Field(default=str(uuid.uuid4()))
+
+    user_id: int | None = Field(default=None, foreign_key="user.id", ondelete="CASCADE")
+    user: User | None = Relationship(back_populates="trials")
+
+    papers: list["Paper"] = Relationship(back_populates="trial", cascade_delete=True)
+
+
+class TrialCreate(TrialBase):
+    pass
+
+
+class TrialRead(TrialBase):
+    uuid: str
+    user: UserRead | None = None
+
+
+class TrialUpdate(SQLModel):
+    pass
+
+
+# paper
+
+
+class PaperBase(SQLModel):
+    paper_id: str | None = Field(default=None, index=True)
+    external_ids: dict | None = Field(default=None, sa_column=Column(JSON))
+    title: str | None = Field(default=None, index=True)
+    abstract: str | None = Field(default=None)
+    venue: str | None = Field(default=None)
+    year: int | None = Field(default=None)
+    citation_count: int | None = Field(default=None)
+    open_access_pdf: dict | None = Field(default=None, sa_column=Column(JSON))
+    fields_of_study: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    publication_types: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    publication_date: str | None = Field(default=None)
+    authors: list[dict] | None = Field(default=None, sa_column=Column(JSON))
+
+
+class Paper(PaperBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    uuid: str = Field(default=str(uuid.uuid4()))
+
+    trial_id: int | None = Field(
+        default=None, foreign_key="trial.id", ondelete="CASCADE"
+    )
+    trial: Trial | None = Relationship(back_populates="papers")
+
+
+class PaperCreate(PaperBase):
+    pass
+
+
+class PaperRead(PaperBase):
+    uuid: str
+    trial: TrialRead | None = None
+
+
+class PaperUpdate(SQLModel):
+    pass

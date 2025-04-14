@@ -1,9 +1,11 @@
 import json
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import modal
+import requests
 from pydantic import BaseModel
 
+from db.models import Paper
 from utils import (
     APP_NAME,
     CPU,
@@ -27,6 +29,11 @@ VOLUME_CONFIG: dict[str | PurePosixPath, modal.Volume] = {
         PRETRAINED_VOLUME, create_if_missing=True
     ),
 }
+if modal.is_local():
+    PRETRAINED_VOL_PATH = None
+else:
+    PRETRAINED_VOL_PATH = Path(f"/{PRETRAINED_VOLUME}")
+
 
 GPU_IMAGE = (
     modal.Image.from_registry(TAG, add_python=PYTHON_VERSION)
@@ -38,6 +45,8 @@ GPU_IMAGE = (
         "huggingface-hub>=0.30.2",
         "ninja>=1.11.1.4",  # required to build flash-attn
         "packaging>=24.2",  # required to build flash-attn
+        "sqlalchemy>=2.0.40",
+        "sqlmodel>=0.0.24",
         "torch>=2.6.0",
         "tqdm>=4.67.1",
         "transformers>=4.51.1",
@@ -48,7 +57,6 @@ GPU_IMAGE = (
     .env(
         {
             "TOKENIZERS_PARALLELISM": "false",
-            "HUGGINGFACE_HUB_CACHE": f"/{PRETRAINED_VOLUME}",
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
         }
     )
@@ -138,7 +146,7 @@ def check_question_threaded(question: str) -> list[str] | None:
     max_num_seqs = 1
     max_model_len = 2048
 
-    temperature = 0.7
+    temperature = 0.0
     top_p = 0.8
     repetition_penalty = 1.05
     stop_token_ids = []
@@ -148,7 +156,7 @@ def check_question_threaded(question: str) -> list[str] | None:
     global small_llm, check_sampling_params
     if "small_llm" not in globals():
         small_llm = LLM(
-            download_dir=f"/{PRETRAINED_VOLUME}",
+            download_dir=PRETRAINED_VOL_PATH,
             model=model_name,
             tokenizer=processor,
             enforce_eager=enforce_eager,
@@ -253,7 +261,7 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
     global small_llm, modify_sampling_params
     if "small_llm" not in globals():
         small_llm = LLM(
-            download_dir=f"/{PRETRAINED_VOLUME}",
+            download_dir=PRETRAINED_VOL_PATH,
             model=model_name,
             tokenizer=processor,
             enforce_eager=enforce_eager,
@@ -287,6 +295,219 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
     return generated_text
 
 
+class SearchParams(BaseModel):
+    query: str | None = None
+    fields: str | None = None
+    fieldsOfStudy: str | None = None
+    year: str | None = None
+    venue: str | None = None
+    minCitationCount: int | None = None
+    sort: str | None = None
+    publicationTypes: str | None = None
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    gpu="l40s:1",
+    volumes=VOLUME_CONFIG,
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+    allow_concurrent_inputs=1000,
+)
+def question_to_query_threaded(question: str) -> dict:
+    """
+    Convert a research question into appropriate search parameters for
+    the Semantic Scholar Paper bulk search API.
+
+    Args:
+        question: The research question to convert
+
+    Returns:
+        A dictionary containing search parameters including query string,
+        fields, and other relevant parameters
+    """
+    system_prompt = """
+    You are a specialized academic search expert who transforms research questions into effective search queries for academic databases. Your expertise is in extracting key concepts and terms from research questions to maximize search relevance and comprehensiveness.
+    """
+    user_prompt = f"""
+    Original research question: "{question}"
+    
+    Task: Convert this research question into an effective search query for the Semantic Scholar Paper bulk search API along with appropriate search parameters.
+    
+    The Semantic Scholar Paper bulk search API supports:
+    - Text query that will be matched against paper titles and abstracts
+    - Boolean operators: + (AND), | (OR), - (negation)
+    - Phrase matching with quotes: "exact phrase"
+    - Proximity search: "term1 term2"~N (terms within N words of each other)
+    - Edit distance for fuzzy matching: term~ (includes close matches like typos)
+    - Prefix matching with asterisk: term*
+    - Grouping with parentheses: (term1 + term2) | term3
+    
+    Boolean Logic Examples:
+    - fish ladder: matches papers containing both "fish" and "ladder"
+    - fish -ladder: matches papers containing "fish" but not "ladder"
+    - fish | ladder: matches papers containing either "fish" or "ladder"
+    - "fish ladder": matches papers containing the exact phrase "fish ladder"
+    - (fish ladder) | outflow: matches papers containing ("fish" AND "ladder") OR "outflow"
+    - fish~: matches papers containing "fish", "fist", "fihs", etc.
+    - "fish ladder"~3: matches papers that contain "fish" and "ladder" within 3 words
+    
+    Guidelines for effective academic search conversion:
+    1. Extract the most important concepts and keywords from the research question
+    2. Use Boolean operators appropriately (primarily OR (|) to ensure broader results)
+    3. Only use quotes for important exact phrases
+    4. Keep the query VERY broad - more results is better than no results
+    5. DO NOT over-restrict the query with too many AND operators
+    6. Focus on the core concepts rather than peripheral details
+    
+    Available API parameters:
+    - query: The text query with Boolean operators (required)
+    - fields: A comma-separated list of fields to return (e.g., "title,abstract,year")
+    - sort: Sort results by paperId, publicationDate, or citationCount (e.g., "citationCount:desc")
+    - publicationTypes: Restrict to specific publication types (Review, JournalArticle, CaseReport, ClinicalTrial, etc.)
+    - openAccessPdf: Restrict to papers with public PDFs (true/false)
+    - minCitationCount: Minimum number of citations (must be an integer value)
+    - year: Specific publication year or range (e.g., "2019" or "2015-2020")
+    - fieldsOfStudy: Restrict to specific fields (comma-separated list)
+    - venue: Restrict to specific journal or conference names (NOT publication types)
+    
+    Fields of Study Options:
+    Computer Science, Medicine, Chemistry, Biology, Materials Science, Physics, Geology, Psychology, Art, History, Geography, Sociology, Business, Political Science, Economics, Philosophy, Mathematics, Engineering, Environmental Science, Agricultural and Food Sciences, Education, Law, Linguistics
+    
+    Publication Types Options:
+    Review, JournalArticle, CaseReport, ClinicalTrial, Conference, Dataset, Editorial, LettersAndComments, MetaAnalysis, News, Study, Book, BookSection
+    
+    Format your response as a valid JSON object with the following keys:
+    {{
+        "query": "The formatted search query string using appropriate operators (KEEP THIS VERY BROAD with OR operators)",
+        "fields": "title,abstract,year,authors,venue,fieldsOfStudy,externalIds,citationCount,openAccessPdf,publicationTypes,publicationDate"
+    }}
+    
+    ONLY add these OPTIONAL parameters if absolutely necessary (in most cases, omit them entirely):
+    - "fieldsOfStudy": "Relevant fields of study if applicable (comma-separated)"
+    - "year": "Relevant year range if applicable (e.g., '2010-2023')"
+    - "publicationTypes": "Relevant publication types if applicable (comma-separated)"
+    - "minCitationCount": Integer value (e.g., 1 or 0)
+    
+    IMPORTANT GUIDELINES:
+    1. The query is THE MOST IMPORTANT parameter - make it as BROAD as possible with multiple OR operators
+    2. DO NOT use venue parameter unless explicitly mentioned in the question
+    3. OMIT all optional parameters by default - only include them if absolutely essential
+    4. If you must use minCitationCount, set it to 0 or 1
+    5. NEVER set venue to a publication type (venue should be specific journal names only)
+    6. AVOID using multiple restrictive parameters together
+    7. When in doubt, prioritize query breadth over all other parameters
+    
+    EXAMPLE GOOD QUERY: "climate change | global warming | climate crisis | environmental change | greenhouse effect"
+    
+    IMPORTANT: Return ONLY the valid JSON object with no additional explanations, commentary, or markdown formatting.
+    """
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    processor = "Qwen/Qwen2.5-1.5B-Instruct"
+    # quantization = None  # "awq_marlin"
+    # kv_cache_dtype = None  # "fp8_e5m2"
+    enforce_eager = False
+    max_num_seqs = 1
+    max_model_len = 2048
+
+    temperature = 0.0
+    top_p = 0.8
+    repetition_penalty = 1.05
+    stop_token_ids = []
+    max_tokens = 512
+
+    global small_llm, modify_sampling_params
+    if "small_llm" not in globals():
+        small_llm = LLM(
+            download_dir=PRETRAINED_VOL_PATH,
+            model=model_name,
+            tokenizer=processor,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel_size=torch.cuda.device_count(),
+            trust_remote_code=True,
+            max_model_len=max_model_len,
+        )
+    if "modify_sampling_params" not in globals():
+        modify_sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            stop_token_ids=stop_token_ids,
+            max_tokens=max_tokens,
+        )
+
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
+        ]
+    ]
+    outputs = small_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
+    generated_text = outputs[0].outputs[0].text.strip()
+    response_dict = json.loads(generated_text)
+    search_params = SearchParams.model_validate(response_dict)
+    return search_params.model_dump()
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+    allow_concurrent_inputs=1000,
+)
+def search_papers_threaded(
+    query: str,
+    fields: str | None = None,
+    fieldsOfStudy: str | None = None,
+    year: str | None = None,
+    venue: str | None = None,
+    minCitationCount: int | None = None,
+    sort: str | None = None,
+    publicationTypes: str | None = None,
+) -> list[dict]:
+    # Construct the base URL
+    url = "http://api.semanticscholar.org/graph/v1/paper/search/bulk?query=" + query
+
+    # Add optional parameters if they are not None
+    if fields:
+        url += f"&fields={fields}"
+    if fieldsOfStudy:
+        url += f"&fieldsOfStudy={fieldsOfStudy}"
+    if year:
+        url += f"&year={year}"
+    if venue:
+        url += f"&venue={venue}"
+    if minCitationCount:
+        url += f"&minCitationCount={minCitationCount}"
+    if sort:
+        url += f"&sort={sort}"
+    if publicationTypes:
+        url += f"&publicationTypes={publicationTypes}"
+
+    r = requests.get(url).json()
+    papers = []
+    while True:
+        if "data" in r:
+            for paper in r["data"]:
+                papers.append(Paper.model_validate(paper).model_dump())
+        if "token" not in r:
+            break
+        r = requests.get(f"{url}&token={r['token']}").json()
+    return papers
+
+
 # -----------------------------------------------------------------------------
 
 
@@ -303,6 +524,24 @@ def main():
     )
     print(modified_question)
 
+    search_params = question_to_query_threaded.remote(
+        "What is the relationship between climate change and global health?"
+    )
+    print(search_params)
+
+    papers = search_papers_threaded.remote(
+        search_params["query"],
+        search_params["fields"],
+        search_params["fieldsOfStudy"],
+        search_params["year"],
+        search_params["venue"],
+        search_params["minCitationCount"],
+        search_params["sort"],
+        search_params["publicationTypes"],
+    )
+    print(len(papers))
+    print(papers[0] if papers else None)
+
 
 if __name__ == "__main__":
     suggestions = check_question_threaded.local(
@@ -315,3 +554,21 @@ if __name__ == "__main__":
         suggestions[0],
     )
     print(modified_question)
+
+    search_params = question_to_query_threaded.local(
+        "What is the relationship between climate change and global health?"
+    )
+    print(search_params)
+
+    papers = search_papers_threaded.local(
+        search_params["query"],
+        search_params["fields"],
+        search_params["fieldsOfStudy"],
+        search_params["year"],
+        search_params["venue"],
+        search_params["minCitationCount"],
+        search_params["sort"],
+        search_params["publicationTypes"],
+    )
+    print(len(papers))
+    print(papers[0] if papers else None)
