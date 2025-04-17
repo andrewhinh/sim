@@ -19,19 +19,8 @@ Create a `.env` (+ `.env.dev` + `.env.local`):
 ```bash
 HF_TOKEN=
 
-POSTGRES_URL=
-POSTGRES_PRISMA_URL=
-SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_URL=
-POSTGRES_URL_NON_POOLING=
-SUPABASE_JWT_SECRET=
-POSTGRES_USER=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
-POSTGRES_PASSWORD=
-POSTGRES_DATABASE=
-SUPABASE_SERVICE_ROLE_KEY=
-POSTGRES_HOST=
-SUPABASE_ANON_KEY=
+DATABASE_URL=
+DOMAIN=
 
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
@@ -47,8 +36,6 @@ SMTP_SERVER=
 SMTP_PORT=
 SMTP_USERNAME=
 SMTP_PASSWORD=
-
-DOMAIN=
 ```
 
 ### Useful Tips
@@ -63,9 +50,15 @@ make migrate MSG="your migration message" ENV=dev
 
 ```bash
 .
-├── assets              # assets.
-├── db                  # database.
-├── src                 # frontend.
+├── .github                 # GitHub Actions.
+├── db                      # database.
+├── Python-Antivirus        # Python Antivirus.
+├── src                     # frontend.
+├── .pre-commit-config.yaml # pre-commit config.
+├── Makefile                # Makefile.
+├── pyproject.toml          # project deps.
+├── README.md               # README.
+├── uv.lock                 # project deps lock.
 ```
 
 ### Frontend

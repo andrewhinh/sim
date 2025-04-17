@@ -34,16 +34,17 @@ init_user_balance = 100
 
 class UserBase(SQLModel):
     balance: int = Field(default=init_user_balance)
-    login_type: str | None = Field()  # github, google, email
-    profile_img: str | None = Field()  # base64
-    email: str | None = Field()
-    username: str | None = Field()
+    login_type: str | None = Field(default=None)  # github, google, email
+    profile_img: str | None = Field(default=None)  # base64
+    email: str | None = Field(default=None)
+    username: str | None = Field(default=None)
 
 
 class User(UserBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
     uuid: str = Field(default=str(uuid.uuid4()))
-    hashed_password: str | None = Field()
+
+    hashed_password: str | None = Field(default=None)
     reset_token: str | None = Field(default=None)
     reset_token_expiry: datetime | None = Field(default=None)
 
@@ -51,7 +52,7 @@ class User(UserBase, table=True):
 
 
 class UserCreate(UserBase):
-    password: str | None = Field()
+    password: str | None = Field(default=None)
 
 
 class UserRead(UserBase):
@@ -69,12 +70,15 @@ class UserUpdate(SQLModel):
 
 
 class TrialBase(SQLModel):
-    pass
+    question: str
+    success: bool | None = Field(default=None)
 
 
 class Trial(TrialBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
     uuid: str = Field(default=str(uuid.uuid4()))
+
+    session_uuid: str | None = Field(default=None)
 
     user_id: int | None = Field(default=None, foreign_key="user.id", ondelete="CASCADE")
     user: User | None = Relationship(back_populates="trials")
@@ -88,7 +92,9 @@ class TrialCreate(TrialBase):
 
 class TrialRead(TrialBase):
     uuid: str
+    session_uuid: str | None = None
     user: UserRead | None = None
+    papers: list["PaperRead"] | None = None
 
 
 class TrialUpdate(SQLModel):
@@ -134,3 +140,8 @@ class PaperRead(PaperBase):
 
 class PaperUpdate(SQLModel):
     pass
+
+
+# Update forward references to resolve circular dependencies
+TrialRead.update_forward_refs()
+PaperRead.update_forward_refs()

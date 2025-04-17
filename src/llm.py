@@ -35,6 +35,32 @@ else:
     PRETRAINED_VOL_PATH = Path(f"/{PRETRAINED_VOLUME}")
 
 
+global small_llm
+
+
+def download_models():
+    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
+    processor = "Qwen/Qwen2.5-1.5B-Instruct"
+    # quantization = None  # "awq_marlin"
+    # kv_cache_dtype = None  # "fp8_e5m2"
+    enforce_eager = False
+    max_num_seqs = 1
+    max_model_len = 2048
+
+    global small_llm
+    if "small_llm" not in globals() or small_llm is None:
+        small_llm = LLM(
+            download_dir=PRETRAINED_VOL_PATH,
+            model=model_name,
+            tokenizer=processor,
+            enforce_eager=enforce_eager,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel_size=torch.cuda.device_count(),
+            trust_remote_code=True,
+            max_model_len=max_model_len,
+        )
+
+
 GPU_IMAGE = (
     modal.Image.from_registry(TAG, add_python=PYTHON_VERSION)
     .apt_install("git")
@@ -60,6 +86,12 @@ GPU_IMAGE = (
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
         }
     )
+    .run_function(
+        download_models,
+        secrets=SECRETS,
+        volumes=VOLUME_CONFIG,
+        gpu="l40s:1",
+    )
     .add_local_python_source("src", copy=True)
 )
 app = modal.App(f"{APP_NAME}-llm")
@@ -76,9 +108,6 @@ class CheckQuestion(BaseModel):
     suggestions: list[str] | None
 
 
-global small_llm, check_sampling_params, modify_sampling_params
-
-
 @app.function(
     image=GPU_IMAGE,
     cpu=CPU,
@@ -88,9 +117,12 @@ global small_llm, check_sampling_params, modify_sampling_params
     secrets=SECRETS,
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
-    allow_concurrent_inputs=1000,
 )
+@modal.concurrent(max_inputs=1000)
 def check_question_threaded(question: str) -> list[str] | None:
+    global small_llm
+    download_models()
+
     max_num_suggestions = 3
 
     system_prompt = """
@@ -138,14 +170,6 @@ def check_question_threaded(question: str) -> list[str] | None:
         Note that each suggestion should be a SINGLE word or phrase, not a full sentence.
     """
 
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    processor = "Qwen/Qwen2.5-1.5B-Instruct"
-    # quantization = None  # "awq_marlin"
-    # kv_cache_dtype = None  # "fp8_e5m2"
-    enforce_eager = False
-    max_num_seqs = 1
-    max_model_len = 2048
-
     temperature = 0.0
     top_p = 0.8
     repetition_penalty = 1.05
@@ -153,27 +177,14 @@ def check_question_threaded(question: str) -> list[str] | None:
     max_tokens = 512
     guided_decoding = GuidedDecodingParams(json=CheckQuestion.model_json_schema())
 
-    global small_llm, check_sampling_params
-    if "small_llm" not in globals():
-        small_llm = LLM(
-            download_dir=PRETRAINED_VOL_PATH,
-            model=model_name,
-            tokenizer=processor,
-            enforce_eager=enforce_eager,
-            max_num_seqs=max_num_seqs,
-            tensor_parallel_size=torch.cuda.device_count(),
-            trust_remote_code=True,
-            max_model_len=max_model_len,
-        )
-    if "check_sampling_params" not in globals():
-        check_sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            stop_token_ids=stop_token_ids,
-            max_tokens=max_tokens,
-            guided_decoding=guided_decoding,
-        )
+    check_sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+        guided_decoding=guided_decoding,
+    )
 
     conversations = [
         [
@@ -205,9 +216,12 @@ def check_question_threaded(question: str) -> list[str] | None:
     secrets=SECRETS,
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
-    allow_concurrent_inputs=1000,
 )
+@modal.concurrent(max_inputs=1000)
 def modify_question_threaded(question: str, suggestion: str) -> str:
+    global small_llm
+    download_models()
+
     system_prompt = """
     You are a specialized research methodology expert who transforms flawed research questions into high-quality ones. Your ONLY task is to improve a given question based on a specific suggestion. Your output should ONLY be the improved question with no additional explanations.
     """
@@ -244,40 +258,19 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
     IMPORTANT: Return ONLY the improved research question as a single sentence or paragraph. Do not include any explanations, bullet points, or meta-commentary.
     """
 
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    processor = "Qwen/Qwen2.5-1.5B-Instruct"
-    # quantization = None  # "awq_marlin"
-    # kv_cache_dtype = None  # "fp8_e5m2"
-    enforce_eager = False
-    max_num_seqs = 1
-    max_model_len = 2048
-
     temperature = 0.7
     top_p = 0.8
     repetition_penalty = 1.05
     stop_token_ids = []
     max_tokens = 512
 
-    global small_llm, modify_sampling_params
-    if "small_llm" not in globals():
-        small_llm = LLM(
-            download_dir=PRETRAINED_VOL_PATH,
-            model=model_name,
-            tokenizer=processor,
-            enforce_eager=enforce_eager,
-            max_num_seqs=max_num_seqs,
-            tensor_parallel_size=torch.cuda.device_count(),
-            trust_remote_code=True,
-            max_model_len=max_model_len,
-        )
-    if "modify_sampling_params" not in globals():
-        modify_sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            stop_token_ids=stop_token_ids,
-            max_tokens=max_tokens,
-        )
+    modify_sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+    )
 
     conversations = [
         [
@@ -315,8 +308,8 @@ class SearchParams(BaseModel):
     secrets=SECRETS,
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
-    allow_concurrent_inputs=1000,
 )
+@modal.concurrent(max_inputs=1000)
 def question_to_query_threaded(question: str) -> dict:
     """
     Convert a research question into appropriate search parameters for
@@ -329,6 +322,9 @@ def question_to_query_threaded(question: str) -> dict:
         A dictionary containing search parameters including query string,
         fields, and other relevant parameters
     """
+    global small_llm
+    download_models()
+
     system_prompt = """
     You are a specialized academic search expert who transforms research questions into effective search queries for academic databases. Your expertise is in extracting key concepts and terms from research questions to maximize search relevance and comprehensiveness.
     """
@@ -405,13 +401,6 @@ def question_to_query_threaded(question: str) -> dict:
     
     IMPORTANT: Return ONLY the valid JSON object with no additional explanations, commentary, or markdown formatting.
     """
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    processor = "Qwen/Qwen2.5-1.5B-Instruct"
-    # quantization = None  # "awq_marlin"
-    # kv_cache_dtype = None  # "fp8_e5m2"
-    enforce_eager = False
-    max_num_seqs = 1
-    max_model_len = 2048
 
     temperature = 0.0
     top_p = 0.8
@@ -419,26 +408,13 @@ def question_to_query_threaded(question: str) -> dict:
     stop_token_ids = []
     max_tokens = 512
 
-    global small_llm, modify_sampling_params
-    if "small_llm" not in globals():
-        small_llm = LLM(
-            download_dir=PRETRAINED_VOL_PATH,
-            model=model_name,
-            tokenizer=processor,
-            enforce_eager=enforce_eager,
-            max_num_seqs=max_num_seqs,
-            tensor_parallel_size=torch.cuda.device_count(),
-            trust_remote_code=True,
-            max_model_len=max_model_len,
-        )
-    if "modify_sampling_params" not in globals():
-        modify_sampling_params = SamplingParams(
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            stop_token_ids=stop_token_ids,
-            max_tokens=max_tokens,
-        )
+    modify_sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+    )
 
     conversations = [
         [
@@ -465,8 +441,8 @@ def question_to_query_threaded(question: str) -> dict:
     secrets=SECRETS,
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
-    allow_concurrent_inputs=1000,
 )
+@modal.concurrent(max_inputs=1000)
 def search_papers_threaded(
     query: str,
     fields: str | None = None,
