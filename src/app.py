@@ -31,7 +31,7 @@ from db.models import (
 )
 from src import llm
 from src.llm import app as llm_app
-from src.llm import check_question_threaded, modify_question_threaded
+from src.llm import check_question_threaded, download_models, modify_question_threaded
 from utils import (
     APP_NAME,
     CPU,
@@ -2312,4 +2312,5 @@ def modal_get():
 
 
 if __name__ == "__main__":
+    download_models()
     fh.serve(app="f_app")

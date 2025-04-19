@@ -1,11 +1,12 @@
 import json
+import os
 from pathlib import Path, PurePosixPath
 
 import modal
 import requests
 from pydantic import BaseModel
 
-from db.models import Paper
+from db.models import PaperBase, SearchParamsBase
 from utils import (
     APP_NAME,
     CPU,
@@ -35,35 +36,34 @@ else:
     PRETRAINED_VOL_PATH = Path(f"/{PRETRAINED_VOLUME}")
 
 
-global small_llm
+small_llm_name = "Qwen/Qwen2.5-3B-Instruct-AWQ"
+medium_llm_name = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+reranker_name = "answerdotai/answerai-colbert-small-v1"
 
 
 def download_models():
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    processor = "Qwen/Qwen2.5-1.5B-Instruct"
-    # quantization = None  # "awq_marlin"
-    # kv_cache_dtype = None  # "fp8_e5m2"
-    enforce_eager = False
-    max_num_seqs = 1
-    max_model_len = 2048
-
-    global small_llm
-    if "small_llm" not in globals() or small_llm is None:
-        small_llm = LLM(
-            download_dir=PRETRAINED_VOL_PATH,
-            model=model_name,
-            tokenizer=processor,
-            enforce_eager=enforce_eager,
-            max_num_seqs=max_num_seqs,
-            tensor_parallel_size=torch.cuda.device_count(),
-            trust_remote_code=True,
-            max_model_len=max_model_len,
-        )
+    snapshot_download(
+        repo_id=small_llm_name,
+        local_dir=PRETRAINED_VOL_PATH,
+        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    )
+    snapshot_download(
+        repo_id=medium_llm_name,
+        local_dir=PRETRAINED_VOL_PATH,
+        ignore_patterns=["*.pt", "*.bin"],  # using safetensors
+    )
+    snapshot_download(
+        repo_id=reranker_name,
+        local_dir=PRETRAINED_VOL_PATH,
+        ignore_patterns=["*.pt", "*.bin"],
+    )  # using safetensors
 
 
 GPU_IMAGE = (
     modal.Image.from_registry(TAG, add_python=PYTHON_VERSION)
-    .apt_install("git")
+    .apt_install(
+        "git", "poppler-utils", "tesseract-ocr", "ffmpeg", "libsm6", "libxext6"
+    )
     .pip_install(
         "accelerate>=1.6.0",
         "flashinfer-python==0.2.2.post1",
@@ -71,11 +71,13 @@ GPU_IMAGE = (
         "huggingface-hub>=0.30.2",
         "ninja>=1.11.1.4",  # required to build flash-attn
         "packaging>=24.2",  # required to build flash-attn
+        "rerankers[transformers]>=0.9.1.post1",
         "sqlalchemy>=2.0.40",
         "sqlmodel>=0.0.24",
         "torch>=2.6.0",
         "tqdm>=4.67.1",
         "transformers>=4.51.1",
+        "unstructured[local-inference,pdf]>=0.17.2",
         "vllm>=0.8.3",
         "wheel>=0.45.1",  # required to build flash-attn
     )
@@ -90,9 +92,8 @@ GPU_IMAGE = (
         download_models,
         secrets=SECRETS,
         volumes=VOLUME_CONFIG,
-        gpu="l40s:1",
     )
-    .add_local_python_source("src", copy=True)
+    .add_local_python_source("_remote_module_non_scriptable", "src", "db", "utils")
 )
 app = modal.App(f"{APP_NAME}-llm")
 
@@ -100,8 +101,13 @@ app = modal.App(f"{APP_NAME}-llm")
 
 with GPU_IMAGE.imports():
     import torch
+    from huggingface_hub import snapshot_download
+    from rerankers import Reranker
+    from unstructured.partition.pdf import partition_pdf
     from vllm import LLM, SamplingParams
     from vllm.sampling_params import GuidedDecodingParams
+
+    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
 class CheckQuestion(BaseModel):
@@ -118,12 +124,20 @@ class CheckQuestion(BaseModel):
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=1000)
+@modal.concurrent(max_inputs=2)
 def check_question_threaded(question: str) -> list[str] | None:
-    global small_llm
-    download_models()
-
     max_num_suggestions = 3
+
+    small_llm = LLM(
+        download_dir=PRETRAINED_VOL_PATH,
+        model=small_llm_name,
+        tokenizer=small_llm_name,
+        enforce_eager=False,
+        max_num_seqs=1,
+        tensor_parallel_size=torch.cuda.device_count(),
+        trust_remote_code=True,
+        max_model_len=32768,
+    )
 
     system_prompt = """
     You are a specialized research methodology expert with extensive experience evaluating academic research questions. 
@@ -176,8 +190,7 @@ def check_question_threaded(question: str) -> list[str] | None:
     stop_token_ids = []
     max_tokens = 512
     guided_decoding = GuidedDecodingParams(json=CheckQuestion.model_json_schema())
-
-    check_sampling_params = SamplingParams(
+    sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
@@ -197,7 +210,7 @@ def check_question_threaded(question: str) -> list[str] | None:
             },
         ]
     ]
-    outputs = small_llm.chat(conversations, check_sampling_params, use_tqdm=True)
+    outputs = small_llm.chat(conversations, sampling_params, use_tqdm=True)
     generated_text = outputs[0].outputs[0].text.strip()
     response_dict = json.loads(generated_text)
     response = CheckQuestion.model_validate(response_dict)
@@ -217,10 +230,18 @@ def check_question_threaded(question: str) -> list[str] | None:
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=1000)
+@modal.concurrent(max_inputs=2)
 def modify_question_threaded(question: str, suggestion: str) -> str:
-    global small_llm
-    download_models()
+    small_llm = LLM(
+        download_dir=PRETRAINED_VOL_PATH,
+        model=small_llm_name,
+        tokenizer=small_llm_name,
+        enforce_eager=False,
+        max_num_seqs=1,
+        tensor_parallel_size=torch.cuda.device_count(),
+        trust_remote_code=True,
+        max_model_len=32768,
+    )
 
     system_prompt = """
     You are a specialized research methodology expert who transforms flawed research questions into high-quality ones. Your ONLY task is to improve a given question based on a specific suggestion. Your output should ONLY be the improved question with no additional explanations.
@@ -288,17 +309,6 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
     return generated_text
 
 
-class SearchParams(BaseModel):
-    query: str | None = None
-    fields: str | None = None
-    fieldsOfStudy: str | None = None
-    year: str | None = None
-    venue: str | None = None
-    minCitationCount: int | None = None
-    sort: str | None = None
-    publicationTypes: str | None = None
-
-
 @app.function(
     image=GPU_IMAGE,
     cpu=CPU,
@@ -309,97 +319,49 @@ class SearchParams(BaseModel):
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=1000)
+@modal.concurrent(max_inputs=2)
 def question_to_query_threaded(question: str) -> dict:
-    """
-    Convert a research question into appropriate search parameters for
-    the Semantic Scholar Paper bulk search API.
-
-    Args:
-        question: The research question to convert
-
-    Returns:
-        A dictionary containing search parameters including query string,
-        fields, and other relevant parameters
-    """
-    global small_llm
-    download_models()
+    medium_llm = LLM(
+        download_dir=PRETRAINED_VOL_PATH,
+        model=medium_llm_name,
+        tokenizer=medium_llm_name,
+        enforce_eager=False,
+        max_num_seqs=1,
+        tensor_parallel_size=torch.cuda.device_count(),
+        trust_remote_code=True,
+        max_model_len=32768,
+    )
 
     system_prompt = """
-    You are a specialized academic search expert who transforms research questions into effective search queries for academic databases. Your expertise is in extracting key concepts and terms from research questions to maximize search relevance and comprehensiveness.
+    You are a specialized academic search expert who transforms research questions into effective search queries for the Semantic Scholar Paper bulk search API.
     """
     user_prompt = f"""
     Original research question: "{question}"
     
-    Task: Convert this research question into an effective search query for the Semantic Scholar Paper bulk search API along with appropriate search parameters.
-    
-    The Semantic Scholar Paper bulk search API supports:
-    - Text query that will be matched against paper titles and abstracts
-    - Boolean operators: + (AND), | (OR), - (negation)
-    - Phrase matching with quotes: "exact phrase"
-    - Proximity search: "term1 term2"~N (terms within N words of each other)
-    - Edit distance for fuzzy matching: term~ (includes close matches like typos)
-    - Prefix matching with asterisk: term*
-    - Grouping with parentheses: (term1 + term2) | term3
-    
-    Boolean Logic Examples:
-    - fish ladder: matches papers containing both "fish" and "ladder"
-    - fish -ladder: matches papers containing "fish" but not "ladder"
-    - fish | ladder: matches papers containing either "fish" or "ladder"
-    - "fish ladder": matches papers containing the exact phrase "fish ladder"
-    - (fish ladder) | outflow: matches papers containing ("fish" AND "ladder") OR "outflow"
-    - fish~: matches papers containing "fish", "fist", "fihs", etc.
-    - "fish ladder"~3: matches papers that contain "fish" and "ladder" within 3 words
-    
-    Guidelines for effective academic search conversion:
-    1. Extract the most important concepts and keywords from the research question
-    2. Use Boolean operators appropriately (primarily OR (|) to ensure broader results)
-    3. Only use quotes for important exact phrases
-    4. Keep the query VERY broad - more results is better than no results
-    5. DO NOT over-restrict the query with too many AND operators
-    6. Focus on the core concepts rather than peripheral details
-    
+    Task: Convert this research question into effective search parameters for the Semantic Scholar Paper bulk search API.
+
     Available API parameters:
     - query: The text query with Boolean operators (required)
-    - fields: A comma-separated list of fields to return (e.g., "title,abstract,year")
-    - sort: Sort results by paperId, publicationDate, or citationCount (e.g., "citationCount:desc")
-    - publicationTypes: Restrict to specific publication types (Review, JournalArticle, CaseReport, ClinicalTrial, etc.)
-    - openAccessPdf: Restrict to papers with public PDFs (true/false)
-    - minCitationCount: Minimum number of citations (must be an integer value)
-    - year: Specific publication year or range (e.g., "2019" or "2015-2020")
-    - fieldsOfStudy: Restrict to specific fields (comma-separated list)
-    - venue: Restrict to specific journal or conference names (NOT publication types)
+    - sort: Sort results by publicationDate or citationCount (e.g., publicationDate:desc, citationCount:asc, etc.) (required)
+    - publicationTypes: Review, JournalArticle, CaseReport, ClinicalTrial, Conference, Dataset, Editorial, LettersAndComments, MetaAnalysis, News, Study, Book, BookSection
+    - year: Specific publication year or range (e.g., "2019", "2015-2020", etc.)
+    - fieldsOfStudy: Computer Science, Medicine, Chemistry, Biology, Materials Science, Physics, Geology, Psychology, Art, History, Geography, Sociology, Business, Political Science, Economics, Philosophy, Mathematics, Engineering, Environmental Science, Agricultural and Food Sciences, Education, Law, Linguistics
     
-    Fields of Study Options:
-    Computer Science, Medicine, Chemistry, Biology, Materials Science, Physics, Geology, Psychology, Art, History, Geography, Sociology, Business, Political Science, Economics, Philosophy, Mathematics, Engineering, Environmental Science, Agricultural and Food Sciences, Education, Law, Linguistics
-    
-    Publication Types Options:
-    Review, JournalArticle, CaseReport, ClinicalTrial, Conference, Dataset, Editorial, LettersAndComments, MetaAnalysis, News, Study, Book, BookSection
-    
-    Format your response as a valid JSON object with the following keys:
+    Tips for query construction:
+    - Search for a phrase: remember that, when we search in library databases, we are searching for words, not topics (e.g., if looking for 'James Earl Ray', use 'James Earl Ray' instead of 'james, and earl, and ray,').
+    - Search for variant forms of words via truncation: enter a common stem, followed by the search engine’s truncation symbol, an asterisk [*]. (e.g., 'immigra*' -> immigrant, immigration, immigrants, immigrate, etc.)
+    - Combine multiple search terms into a single query via Boolean Searching: | for OR, + for AND (e.g., 'immigrant | immigration' -> immigrant OR immigration)
+
+    Format response as JSON:
     {{
-        "query": "The formatted search query string using appropriate operators (KEEP THIS VERY BROAD with OR operators)",
-        "fields": "title,abstract,year,authors,venue,fieldsOfStudy,externalIds,citationCount,openAccessPdf,publicationTypes,publicationDate"
+        "query": <query>,
+        "sort": <type:order>,
+        "publicationTypes": <comma-separated list of relevant publication types (if applicable)>,
+        "year": <year (or range)> (if applicable),
+        "fieldsOfStudy": <comma-separated list of relevant fields of study (if applicable)>,
     }}
-    
-    ONLY add these OPTIONAL parameters if absolutely necessary (in most cases, omit them entirely):
-    - "fieldsOfStudy": "Relevant fields of study if applicable (comma-separated)"
-    - "year": "Relevant year range if applicable (e.g., '2010-2023')"
-    - "publicationTypes": "Relevant publication types if applicable (comma-separated)"
-    - "minCitationCount": Integer value (e.g., 1 or 0)
-    
-    IMPORTANT GUIDELINES:
-    1. The query is THE MOST IMPORTANT parameter - make it as BROAD as possible with multiple OR operators
-    2. DO NOT use venue parameter unless explicitly mentioned in the question
-    3. OMIT all optional parameters by default - only include them if absolutely essential
-    4. If you must use minCitationCount, set it to 0 or 1
-    5. NEVER set venue to a publication type (venue should be specific journal names only)
-    6. AVOID using multiple restrictive parameters together
-    7. When in doubt, prioritize query breadth over all other parameters
-    
-    EXAMPLE GOOD QUERY: "climate change | global warming | climate crisis | environmental change | greenhouse effect"
-    
-    IMPORTANT: Return ONLY the valid JSON object with no additional explanations, commentary, or markdown formatting.
+
+    Return ONLY the valid JSON object without additional text.
     """
 
     temperature = 0.0
@@ -407,6 +369,7 @@ def question_to_query_threaded(question: str) -> dict:
     repetition_penalty = 1.05
     stop_token_ids = []
     max_tokens = 512
+    guided_decoding = GuidedDecodingParams(json=SearchParamsBase.model_json_schema())
 
     modify_sampling_params = SamplingParams(
         temperature=temperature,
@@ -414,6 +377,7 @@ def question_to_query_threaded(question: str) -> dict:
         repetition_penalty=repetition_penalty,
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
+        guided_decoding=guided_decoding,
     )
 
     conversations = [
@@ -427,10 +391,10 @@ def question_to_query_threaded(question: str) -> dict:
             },
         ]
     ]
-    outputs = small_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
+    outputs = medium_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
     generated_text = outputs[0].outputs[0].text.strip()
     response_dict = json.loads(generated_text)
-    search_params = SearchParams.model_validate(response_dict)
+    search_params = SearchParamsBase.model_validate(response_dict)
     return search_params.model_dump()
 
 
@@ -445,106 +409,184 @@ def question_to_query_threaded(question: str) -> dict:
 @modal.concurrent(max_inputs=1000)
 def search_papers_threaded(
     query: str,
-    fields: str | None = None,
-    fieldsOfStudy: str | None = None,
-    year: str | None = None,
-    venue: str | None = None,
-    minCitationCount: int | None = None,
     sort: str | None = None,
     publicationTypes: str | None = None,
+    year: str | None = None,
+    venue: str | None = None,
+    fieldsOfStudy: str | None = None,
 ) -> list[dict]:
-    # Construct the base URL
-    url = "http://api.semanticscholar.org/graph/v1/paper/search/bulk?query=" + query
+    max_results = 10000
 
-    # Add optional parameters if they are not None
-    if fields:
-        url += f"&fields={fields}"
-    if fieldsOfStudy:
-        url += f"&fieldsOfStudy={fieldsOfStudy}"
-    if year:
-        url += f"&year={year}"
-    if venue:
-        url += f"&venue={venue}"
-    if minCitationCount:
-        url += f"&minCitationCount={minCitationCount}"
+    url = "http://api.semanticscholar.org/graph/v1/paper/search/bulk"
+    url += f"?query={query}"
+    url += "&fields=matchScore,paperId,corpusId,externalIds,url,title,abstract,venue,publicationVenue,year,referenceCount,citationCount,influentialCitationCount,isOpenAccess,openAccessPdf,fieldsOfStudy,s2FieldsOfStudy,publicationTypes,publicationDate,journal,citationStyles,authors,citations,references,embedding,tldr"
     if sort:
         url += f"&sort={sort}"
     if publicationTypes:
         url += f"&publicationTypes={publicationTypes}"
+    url += "&isOpenAccess"
+    url += "&minCitationCount=0"
+    if year:
+        url += f"&year={year}"
+    if venue:
+        url += f"&venue={venue}"
+    if fieldsOfStudy:
+        url += f"&fieldsOfStudy={fieldsOfStudy}"
 
     r = requests.get(url).json()
     papers = []
     while True:
         if "data" in r:
-            for paper in r["data"]:
-                papers.append(Paper.model_validate(paper).model_dump())
-        if "token" not in r:
+            for paper_data in r["data"]:
+                is_open_access = paper_data["isOpenAccess"]
+                if is_open_access:
+                    paper = PaperBase(
+                        match_score=paper_data["matchScore"],
+                        paper_id=paper_data["paperId"],
+                        corpusId=paper_data["corpusId"],
+                        external_ids=paper_data["externalIds"],
+                        url=paper_data["url"],
+                        title=paper_data["title"],
+                        abstract=paper_data["abstract"],
+                        venue=paper_data["venue"],
+                        publicationVenue=paper_data["publicationVenue"],
+                        year=paper_data["year"],
+                        reference_count=paper_data["referenceCount"],
+                        citation_count=paper_data["citationCount"],
+                        influential_citation_count=paper_data[
+                            "influentialCitationCount"
+                        ],
+                        is_open_access=is_open_access,
+                        open_access_pdf=paper_data["openAccessPdf"],
+                        fields_of_study=paper_data["fieldsOfStudy"],
+                        s2_fields_of_study=paper_data["s2FieldsOfStudy"],
+                        publication_types=paper_data["publicationTypes"],
+                        publication_date=paper_data["publicationDate"],
+                        journal=paper_data["journal"],
+                        citation_styles=paper_data["citationStyles"],
+                        authors=paper_data["authors"],
+                    )
+                    papers.append(paper.model_dump())
+        if "token" not in r or len(papers) >= max_results:
             break
         r = requests.get(f"{url}&token={r['token']}").json()
     return papers
 
 
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    gpu="l40s:1",
+    volumes=VOLUME_CONFIG,
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+)
+@modal.concurrent(max_inputs=4)
+def rerank_papers_threaded(question: str, papers: list[dict]) -> list[dict]:
+    max_results = 100
+
+    ranker = Reranker(
+        reranker_name,
+        model_type="colbert",
+        verbose=0,
+        dtype=torch.bfloat16,
+        device="cuda",
+        batch_size=16,
+        model_kwargs={"cache_dir": PRETRAINED_VOL_PATH},
+    )
+    docs = [
+        f"""
+        Title: {paper["title"]}
+        Abstract: {paper["abstract"]}
+        Venue: {paper["venue"]}
+        Publication Venue: 
+            Name: {paper["publicationVenue"]["name"]}
+            Type: {paper["publicationVenue"]["type"]}
+        Year: {paper["year"]}
+        Reference Count: {paper["referenceCount"]}
+        Citation Count: {paper["citationCount"]}
+        Influential Citation Count: {paper["influentialCitationCount"]}
+        Fields of Study: {paper["fieldsOfStudy"]}
+        Publication Types: {paper["publicationTypes"]}
+        Publication Date: {paper["publicationDate"]}
+        Journal: {paper["journal"]}
+        Authors: {"\n\n".join(
+            [
+                f"""
+        Name: {author["name"]}
+        Affiliations: {', '.join(author["affiliations"])}
+        Paper Count: {author["paperCount"]}
+        Citation Count: {author["citationCount"]}
+        H-Index: {author["hIndex"]}
+        """
+                for author in paper["authors"]
+            ]
+        )}
+        Text: {"\n\n".join([element.text for element in partition_pdf(
+            paper["openAccessPdf"]["url"],
+            url=None,
+        )])}
+        """
+        for paper in papers
+    ]
+    results = ranker.rank(query=question, docs=docs)
+    top_k_idxs = [doc.doc_id for doc in results.top_k(max_results)]
+    return [papers[i] for i in top_k_idxs]
+
+
 # -----------------------------------------------------------------------------
+
+default_question = "What is the relationship between climate change and global health?"
 
 
 @app.local_entrypoint()
 def main():
-    suggestions = check_question_threaded.remote(
-        "What is the relationship between climate change and global health?"
-    )
+    suggestions = check_question_threaded.remote(default_question)
     print(suggestions)
 
     modified_question = modify_question_threaded.remote(
-        "What is the relationship between climate change and global health?",
+        default_question,
         suggestions[0],
     )
     print(modified_question)
 
-    search_params = question_to_query_threaded.remote(
-        "What is the relationship between climate change and global health?"
-    )
+    search_params = question_to_query_threaded.remote(modified_question)
     print(search_params)
 
-    papers = search_papers_threaded.remote(
-        search_params["query"],
-        search_params["fields"],
-        search_params["fieldsOfStudy"],
-        search_params["year"],
-        search_params["venue"],
-        search_params["minCitationCount"],
-        search_params["sort"],
-        search_params["publicationTypes"],
-    )
+    papers = search_papers_threaded.remote(**search_params)
     print(len(papers))
     print(papers[0] if papers else None)
+
+    reranked_papers = rerank_papers_threaded.remote(
+        modified_question,
+        papers,
+    )
+    print(len(reranked_papers))
+    print(reranked_papers[0] if reranked_papers else None)
 
 
 if __name__ == "__main__":
-    suggestions = check_question_threaded.local(
-        "What is the relationship between climate change and global health?"
-    )
+    suggestions = check_question_threaded.local(default_question)
     print(suggestions)
 
     modified_question = modify_question_threaded.local(
-        "What is the relationship between climate change and global health?",
+        default_question,
         suggestions[0],
     )
     print(modified_question)
 
-    search_params = question_to_query_threaded.local(
-        "What is the relationship between climate change and global health?"
-    )
+    search_params = question_to_query_threaded.local(modified_question)
     print(search_params)
 
-    papers = search_papers_threaded.local(
-        search_params["query"],
-        search_params["fields"],
-        search_params["fieldsOfStudy"],
-        search_params["year"],
-        search_params["venue"],
-        search_params["minCitationCount"],
-        search_params["sort"],
-        search_params["publicationTypes"],
-    )
+    papers = search_papers_threaded.local(**search_params)
     print(len(papers))
     print(papers[0] if papers else None)
+
+    reranked_papers = rerank_papers_threaded.local(
+        modified_question,
+        papers,
+    )
+    print(len(reranked_papers))
+    print(reranked_papers[0] if reranked_papers else None)

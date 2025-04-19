@@ -83,6 +83,9 @@ class Trial(TrialBase, table=True):
     user_id: int | None = Field(default=None, foreign_key="user.id", ondelete="CASCADE")
     user: User | None = Relationship(back_populates="trials")
 
+    search_params: "SearchParams" = Relationship(
+        back_populates="trial", cascade_delete=True
+    )
     papers: list["Paper"] = Relationship(back_populates="trial", cascade_delete=True)
 
 
@@ -94,6 +97,7 @@ class TrialRead(TrialBase):
     uuid: str
     session_uuid: str | None = None
     user: UserRead | None = None
+    search_params: "SearchParamsRead" = None
     papers: list["PaperRead"] | None = None
 
 
@@ -101,21 +105,65 @@ class TrialUpdate(SQLModel):
     pass
 
 
+# search params
+
+
+class SearchParamsBase(SQLModel):
+    query: str | None = None
+    sort: str | None = None
+    publicationTypes: str | None = None
+    year: str | None = None
+    fieldsOfStudy: str | None = None
+
+
+class SearchParams(SearchParamsBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    uuid: str = Field(default=str(uuid.uuid4()))
+
+    trial_id: int | None = Field(
+        default=None, foreign_key="trial.id", ondelete="CASCADE"
+    )
+    trial: Trial | None = Relationship(back_populates="search_params")
+
+
+class SearchParamsCreate(SearchParamsBase):
+    pass
+
+
+class SearchParamsRead(SearchParamsBase):
+    uuid: str
+    trial: TrialRead | None = None
+
+
+class SearchParamsUpdate(SQLModel):
+    pass
+
+
 # paper
 
 
 class PaperBase(SQLModel):
+    match_score: float | None = Field(default=None)
     paper_id: str | None = Field(default=None, index=True)
+    corpusId: str | None = Field(default=None, index=True)
     external_ids: dict | None = Field(default=None, sa_column=Column(JSON))
+    url: str | None = Field(default=None)
     title: str | None = Field(default=None, index=True)
     abstract: str | None = Field(default=None)
     venue: str | None = Field(default=None)
+    publicationVenue: dict | None = Field(default=None, sa_column=Column(JSON))
     year: int | None = Field(default=None)
+    reference_count: int | None = Field(default=None)
     citation_count: int | None = Field(default=None)
+    influential_citation_count: int | None = Field(default=None)
+    is_open_access: bool | None = Field(default=None)
     open_access_pdf: dict | None = Field(default=None, sa_column=Column(JSON))
     fields_of_study: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    s2_fields_of_study: list[dict] | None = Field(default=None, sa_column=Column(JSON))
     publication_types: list[str] | None = Field(default=None, sa_column=Column(JSON))
     publication_date: str | None = Field(default=None)
+    journal: dict | None = Field(default=None, sa_column=Column(JSON))
+    citation_styles: dict | None = Field(default=None, sa_column=Column(JSON))
     authors: list[dict] | None = Field(default=None, sa_column=Column(JSON))
 
 
@@ -144,4 +192,5 @@ class PaperUpdate(SQLModel):
 
 # Update forward references to resolve circular dependencies
 TrialRead.update_forward_refs()
+SearchParamsRead.update_forward_refs()
 PaperRead.update_forward_refs()
