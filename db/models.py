@@ -1,5 +1,6 @@
-import uuid
 from datetime import datetime
+from typing import Optional
+from uuid import UUID, uuid4
 
 from sqlalchemy import JSON, Column
 from sqlmodel import Field, Relationship, SQLModel
@@ -16,18 +17,6 @@ class GlobalBalance(GlobalBalanceBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
 
-class GlobalBalanceCreate(GlobalBalanceBase):
-    pass
-
-
-class GlobalBalanceRead(GlobalBalanceBase):
-    id: int
-
-
-class GlobalBalanceUpdate(SQLModel):
-    balance: int | None = None
-
-
 # user
 init_user_balance = 100
 
@@ -42,7 +31,9 @@ class UserBase(SQLModel):
 
 class User(UserBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: str = Field(default=str(uuid.uuid4()))
+    uuid: UUID = Field(
+        default_factory=uuid4,
+    )
 
     hashed_password: str | None = Field(default=None)
     reset_token: str | None = Field(default=None)
@@ -56,14 +47,8 @@ class UserCreate(UserBase):
 
 
 class UserRead(UserBase):
-    uuid: str
-
-
-class UserUpdate(SQLModel):
-    balance: int | None = None
-    profile_img: str | None = None
-    email: str | None = None
-    password: str | None = None
+    uuid: UUID
+    trials: list["Trial"] | None = None
 
 
 # trial
@@ -76,29 +61,37 @@ class TrialBase(SQLModel):
 
 class Trial(TrialBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: str = Field(default=str(uuid.uuid4()))
+    uuid: UUID = Field(default_factory=uuid4)
 
-    session_uuid: str | None = Field(default=None)
+    session_uuid: UUID | None = Field(default=None)
 
     user_id: int | None = Field(default=None, foreign_key="user.id", ondelete="CASCADE")
     user: User | None = Relationship(back_populates="trials")
 
-    papers: list["Paper"] = Relationship(back_populates="trial", cascade_delete=True)
+    search_params: Optional["SearchParams"] = Relationship(
+        back_populates="trial", cascade_delete=True
+    )
+    papers: list["Paper"] | None = Relationship(
+        back_populates="trial",
+        cascade_delete=True,
+    )
 
 
-class TrialCreate(TrialBase):
-    pass
+# search params
 
 
-class TrialRead(TrialBase):
-    uuid: str
-    session_uuid: str | None = None
-    user: UserRead | None = None
-    papers: list["PaperRead"] | None = None
+class SearchParamsBase(SQLModel):
+    query: str | None = None
 
 
-class TrialUpdate(SQLModel):
-    pass
+class SearchParams(SearchParamsBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    uuid: UUID = Field(default_factory=uuid4)
+
+    trial_id: int | None = Field(
+        default=None, foreign_key="trial.id", ondelete="CASCADE"
+    )
+    trial: Trial | None = Relationship(back_populates="search_params")
 
 
 # paper
@@ -106,42 +99,35 @@ class TrialUpdate(SQLModel):
 
 class PaperBase(SQLModel):
     paper_id: str | None = Field(default=None, index=True)
+    corpus_id: int | None = Field(default=None, index=True)
     external_ids: dict | None = Field(default=None, sa_column=Column(JSON))
+    url: str | None = Field(default=None)
     title: str | None = Field(default=None, index=True)
     abstract: str | None = Field(default=None)
     venue: str | None = Field(default=None)
+    publication_venue: dict | None = Field(default=None, sa_column=Column(JSON))
     year: int | None = Field(default=None)
+    reference_count: int | None = Field(default=None)
     citation_count: int | None = Field(default=None)
+    influential_citation_count: int | None = Field(default=None)
+    is_open_access: bool | None = Field(default=None)
     open_access_pdf: dict | None = Field(default=None, sa_column=Column(JSON))
     fields_of_study: list[str] | None = Field(default=None, sa_column=Column(JSON))
+    s2_fields_of_study: list[dict] | None = Field(default=None, sa_column=Column(JSON))
     publication_types: list[str] | None = Field(default=None, sa_column=Column(JSON))
     publication_date: str | None = Field(default=None)
+    journal: dict | None = Field(default=None, sa_column=Column(JSON))
+    citation_styles: dict | None = Field(default=None, sa_column=Column(JSON))
     authors: list[dict] | None = Field(default=None, sa_column=Column(JSON))
+
+    text: str | None = Field(default=None)
 
 
 class Paper(PaperBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: str = Field(default=str(uuid.uuid4()))
+    uuid: UUID = Field(default_factory=uuid4)
 
     trial_id: int | None = Field(
         default=None, foreign_key="trial.id", ondelete="CASCADE"
     )
     trial: Trial | None = Relationship(back_populates="papers")
-
-
-class PaperCreate(PaperBase):
-    pass
-
-
-class PaperRead(PaperBase):
-    uuid: str
-    trial: TrialRead | None = None
-
-
-class PaperUpdate(SQLModel):
-    pass
-
-
-# Update forward references to resolve circular dependencies
-TrialRead.update_forward_refs()
-PaperRead.update_forward_refs()

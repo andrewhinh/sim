@@ -18,20 +18,22 @@ import modal
 
 from db.models import (
     GlobalBalance,
-    GlobalBalanceCreate,
-    GlobalBalanceRead,
     Paper,
-    PaperCreate,
+    SearchParams,
     Trial,
-    TrialCreate,
-    TrialRead,
     User,
+    UserCreate,
     UserRead,
     init_balance,
 )
-from src import llm
 from src.llm import app as llm_app
-from src.llm import check_question_threaded, modify_question_threaded
+from src.llm import (
+    check_question_threaded,
+    download_models,
+    modify_question_threaded,
+    question_to_search_params_and_papers_threaded,
+    rerank_papers_threaded,
+)
 from utils import (
     APP_NAME,
     CPU,
@@ -141,9 +143,7 @@ def get_app():  # noqa: C901
     # FastHTML setup
     def before(req, sess):
         if "session_uuid" not in sess:
-            req.scope["session_uuid"] = sess.setdefault(
-                "session_uuid", str(uuid.uuid4())
-            )
+            req.scope["session_uuid"] = sess.setdefault("session_uuid", uuid.uuid4())
         if "user_uuid" not in sess:
             req.scope["user_uuid"] = sess.setdefault("user_uuid", "")
 
@@ -219,31 +219,29 @@ def get_app():  # noqa: C901
         with get_db_session() as db_session:
             curr_balance = db_session.get(GlobalBalance, 1)
             if not curr_balance:
-                new_balance = GlobalBalanceCreate(balance=init_balance)
-                curr_balance = GlobalBalance.model_validate(new_balance)
+                curr_balance = GlobalBalance(balance=init_balance)
                 db_session.add(curr_balance)
                 db_session.commit()
                 db_session.refresh(curr_balance)
             return curr_balance
 
-    def get_curr_user(session) -> UserRead:
-        if session["user_uuid"]:
-            with get_db_session() as db_session:
-                query = select(User).where(User.uuid == session["user_uuid"])
-                return db_session.exec(query).first()
-        return None
-
-    def get_curr_trials(session) -> list[TrialRead]:
+    def get_curr_user(session, read: bool = False) -> User | None:
         if session["user_uuid"]:
             with get_db_session() as db_session:
                 query = select(User).where(User.uuid == session["user_uuid"])
                 curr_user = db_session.exec(query).first()
                 if not curr_user:
-                    return []
-                return [TrialRead.model_validate(trial) for trial in curr_user.trials]
+                    return None
+                return curr_user if read else UserRead.model_validate(curr_user)
+        return None
+
+    def get_curr_trials(session) -> list[Trial]:
+        curr_user = get_curr_user(session, True)
+        if curr_user:
+            return curr_user.trials
         return []
 
-    def get_trial(session, uuid: str) -> TrialRead:
+    def get_trial(session, uuid: str) -> Trial | None:
         with get_db_session() as db_session:
             query = (
                 select(Trial)
@@ -253,7 +251,7 @@ def get_app():  # noqa: C901
             curr_trial = db_session.exec(query).first()
             if not curr_trial:
                 return None
-            return TrialRead.model_validate(curr_trial)
+            return curr_trial
 
     # stripe
     stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -281,16 +279,15 @@ def get_app():  # noqa: C901
         "fasting and cognition": "How does intermittent fasting affect cognitive performance and memory function in healthy adults over a 12-week period?",
         "CV health and exercise intensity": "To what extent does high-intensity interval training versus moderate continuous exercise impact cardiovascular health markers in sedentary middle-aged individuals?",
     }
-    section_to_fn = {
-        "Creating search parameters": "question_to_query_threaded",
-        "Searching for papers": "search_papers_threaded",
-        "Screening papers": "screen_papers_threaded",
-        "Extracting data": "extract_data_threaded",
-        "Generating participants": "generate_participants_threaded",
-        "Simulating study": "simulate_study_threaded",
-        "Clustering participants": "cluster_participants_threaded",
-        "Generating visualization": "generate_visualization_threaded",
-    }
+    sections = [
+        "Searching for papers",
+        "Screening papers",
+        "Extracting data",
+        "Generating participants",
+        "Simulating study",
+        "Clustering participants",
+        "Generating visualization",
+    ]
 
     # ui components
     def spinner(id="", cls=""):
@@ -308,7 +305,7 @@ def get_app():  # noqa: C901
         )
 
     def trial_view(
-        trial: TrialRead,
+        trial: Trial,
     ):
         limit_chars = 1000
         return (
@@ -328,7 +325,7 @@ def get_app():  # noqa: C901
                         ),
                         spinner(
                             id=f"trial-{trial.uuid}-show-select-delete-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         fh.Svg(
                             fh.NotStr(
@@ -339,11 +336,11 @@ def get_app():  # noqa: C901
                             hx_target="closest tr",
                             hx_swap="outerHTML swap:.25s",
                             hx_confirm="Are you sure?",
-                            cls=f"hide-when-loading w-8 h-8 text-{click_danger_color} hover:text-{click_danger_hover_color}",
+                            cls=f"hide-when-loading size-8 text-{click_danger_color} hover:text-{click_danger_hover_color}",
                         ),
                         spinner(
                             id=f"trial-{trial.uuid}-delete-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         cls="w-1/6 flex justify-start items-center gap-2",
                     ),
@@ -360,7 +357,7 @@ def get_app():  # noqa: C901
                             hx_ext="sse",
                             sse_connect=f"/trials/{trial.uuid}/stream",
                             sse_swap="UpdateTrial",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         cls="w-5/6",
                     ),
@@ -383,10 +380,10 @@ def get_app():  # noqa: C901
                         <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/>
                     </svg>""",
                 ),
-                cls=f"w-6 h-6 text-{text_color}",
+                cls=f"size-6 text-{text_color}",
             ),
             "running": spinner(
-                cls=f"w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                cls=f"size-6 text-{text_color} hover:text-{text_button_hover_color}",
             ),
             "completed": fh.Svg(
                 fh.NotStr(
@@ -394,7 +391,7 @@ def get_app():  # noqa: C901
                         <path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" fill="currentColor"/>
                     </svg>"""
                 ),
-                cls=f"w-6 h-6 text-{click_color}",
+                cls=f"size-6 text-{click_color}",
             ),
             "failed": fh.Svg(
                 fh.NotStr(
@@ -402,7 +399,7 @@ def get_app():  # noqa: C901
                         <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" fill="currentColor"/>
                     </svg>"""
                 ),
-                cls=f"w-6 h-6 text-{error_color}",
+                cls=f"size-6 text-{error_color}",
             ),
         }
         return fh.Div(
@@ -412,7 +409,7 @@ def get_app():  # noqa: C901
                 cls=f"text-md text-{text_color}",
             ),
             id=section_id,
-            cls="w-full md:w-3/4 flex justify-start items-center gap-16",
+            cls="w-full md:w-2/3 flex justify-start items-center gap-12 md:gap-16",
         )
 
     def num_trials(session, hx_swap_oob: str = "false"):
@@ -439,7 +436,7 @@ def get_app():  # noqa: C901
                 ),
                 spinner(
                     id="delete-select-trials-loader",
-                    cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                    cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_delete="/trials/select",
                 hx_target="#trial-list",
@@ -458,7 +455,7 @@ def get_app():  # noqa: C901
                 ),
                 spinner(
                     id="delete-all-trials-loader",
-                    cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                    cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_delete="/trials",
                 hx_target="#trial-list",
@@ -477,13 +474,14 @@ def get_app():  # noqa: C901
     def get_trial_table_part(session, part_num: int = 1):
         size = 50
         curr_trials = get_curr_trials(session)
+        if not curr_trials:
+            return ()
         curr_trials_part = curr_trials[(part_num - 1) * size : part_num * size]
         global shown_trials
         shown_trials = list(
             set(shown_trials) | {trial.id for trial in curr_trials_part}
         )
-        read_trials = [TrialRead.model_validate(trial) for trial in curr_trials_part]
-        paginated = [trial_view(trial) for trial in read_trials]
+        paginated = [trial_view(trial) for trial in curr_trials_part]
         return tuple(paginated)
 
     def trial_load_more(session, idx: int = 2, hx_swap_oob: str = "false"):
@@ -500,7 +498,7 @@ def get_app():  # noqa: C901
                 ),
                 spinner(
                     id="load-more-trials-loader",
-                    cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                    cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_get=f"/trials/page/{idx}",
                 hx_indicator="#load-more-trials-button-text, #load-more-trials-loader",
@@ -524,7 +522,7 @@ def get_app():  # noqa: C901
                 fh.A(
                     fh.Img(
                         src="/logo.png",
-                        cls="w-10 h-10 object-contain",
+                        cls="size-10 object-contain",
                     ),
                     fh.P(
                         APP_NAME,
@@ -593,7 +591,7 @@ def get_app():  # noqa: C901
                     ),
                     fh.Div(
                         spinner(
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_hover_color}"
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_hover_color}"
                         ),
                         fh.P(
                             "Evaluating question strength...",
@@ -604,7 +602,7 @@ def get_app():  # noqa: C901
                     ),
                     fh.Div(
                         spinner(
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_hover_color}"
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_hover_color}"
                         ),
                         fh.P(
                             "Modifying question...",
@@ -623,7 +621,7 @@ def get_app():  # noqa: C901
                     ),
                     spinner(
                         id="question-form-loader",
-                        cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                        cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     id="question-form-button",
                     type="submit",
@@ -690,7 +688,7 @@ def get_app():  # noqa: C901
                                 fh.NotStr(
                                     si_github.svg,
                                 ),
-                                cls="w-6 h-6",
+                                cls="size-6",
                             ),
                             fh.Div(
                                 "Continue with GitHub",
@@ -710,7 +708,7 @@ def get_app():  # noqa: C901
                                 fh.NotStr(
                                     """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.0003 4.75C13.7703 4.75 15.3553 5.36002 16.6053 6.54998L20.0303 3.125C17.9502 1.19 15.2353 0 12.0003 0C7.31028 0 3.25527 2.69 1.28027 6.60998L5.27028 9.70498C6.21525 6.86002 8.87028 4.75 12.0003 4.75Z" fill="#EA4335"/><path d="M23.49 12.275C23.49 11.49 23.415 10.73 23.3 10H12V14.51H18.47C18.18 15.99 17.34 17.25 16.08 18.1L19.945 21.1C22.2 19.01 23.49 15.92 23.49 12.275Z" fill="#4285F4"/><path d="M5.26498 14.2949C5.02498 13.5699 4.88501 12.7999 4.88501 11.9999C4.88501 11.1999 5.01998 10.4299 5.26498 9.7049L1.275 6.60986C0.46 8.22986 0 10.0599 0 11.9999C0 13.9399 0.46 15.7699 1.28 17.3899L5.26498 14.2949Z" fill="#FBBC05"/><path d="M12.0004 24.0001C15.2404 24.0001 17.9654 22.935 19.9454 21.095L16.0804 18.095C15.0054 18.82 13.6204 19.245 12.0004 19.245C8.8704 19.245 6.21537 17.135 5.2654 14.29L1.27539 17.385C3.25539 21.31 7.3104 24.0001 12.0004 24.0001Z" fill="#34A853"/></svg>"""
                                 ),
-                                cls="w-6 h-6",
+                                cls="size-6",
                             ),
                             fh.Div(
                                 "Continue with Google",
@@ -754,7 +752,7 @@ def get_app():  # noqa: C901
                         ),
                         spinner(
                             id="signup-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         id="signup-button",
                         type="submit",
@@ -796,7 +794,7 @@ def get_app():  # noqa: C901
                                 fh.NotStr(
                                     si_github.svg,
                                 ),
-                                cls="w-6 h-6",
+                                cls="size-6",
                             ),
                             fh.Div(
                                 "Continue with GitHub",
@@ -816,7 +814,7 @@ def get_app():  # noqa: C901
                                 fh.NotStr(
                                     """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.0003 4.75C13.7703 4.75 15.3553 5.36002 16.6053 6.54998L20.0303 3.125C17.9502 1.19 15.2353 0 12.0003 0C7.31028 0 3.25527 2.69 1.28027 6.60998L5.27028 9.70498C6.21525 6.86002 8.87028 4.75 12.0003 4.75Z" fill="#EA4335"/><path d="M23.49 12.275C23.49 11.49 23.415 10.73 23.3 10H12V14.51H18.47C18.18 15.99 17.34 17.25 16.08 18.1L19.945 21.1C22.2 19.01 23.49 15.92 23.49 12.275Z" fill="#4285F4"/><path d="M5.26498 14.2949C5.02498 13.5699 4.88501 12.7999 4.88501 11.9999C4.88501 11.1999 5.01998 10.4299 5.26498 9.7049L1.275 6.60986C0.46 8.22986 0 10.0599 0 11.9999C0 13.9399 0.46 15.7699 1.28 17.3899L5.26498 14.2949Z" fill="#FBBC05"/><path d="M12.0004 24.0001C15.2404 24.0001 17.9654 22.935 19.9454 21.095L16.0804 18.095C15.0054 18.82 13.6204 19.245 12.0004 19.245C8.8704 19.245 6.21537 17.135 5.2654 14.29L1.27539 17.385C3.25539 21.31 7.3104 24.0001 12.0004 24.0001Z" fill="#34A853"/></svg>"""
                                 ),
-                                cls="w-6 h-6",
+                                cls="size-6",
                             ),
                             fh.Div(
                                 "Continue with Google",
@@ -860,7 +858,7 @@ def get_app():  # noqa: C901
                         ),
                         spinner(
                             id="login-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         id="login-button",
                         type="submit",
@@ -918,7 +916,7 @@ def get_app():  # noqa: C901
                     ),
                     spinner(
                         id="forgot-password-loader",
-                        cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                        cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     id="forgot-password-button",
                     type="submit",
@@ -984,7 +982,7 @@ def get_app():  # noqa: C901
                     ),
                     spinner(
                         id="reset-password-loader",
-                        cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                        cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     id="reset-password-button",
                     type="submit",
@@ -1039,23 +1037,31 @@ def get_app():  # noqa: C901
             fh.Div(
                 *[
                     section_view(
-                        section_header,
+                        section,
                         "pending",
                         f"section-{trial.uuid}-{i}",
                     )
-                    for i, section_header in enumerate(section_to_fn)
+                    for i, section in enumerate(sections)
                 ],
                 id=f"trial-expanded-{trial.uuid}",
                 hx_ext="ws",
                 ws_connect=f"/trial/ws/{trial.uuid}",
                 hx_trigger="load",
-                cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-center items-end gap-8 md:gap-12",
+                cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-start items-end pt-8 gap-8 md:gap-12",
             ),
             cls=f"{page_ctnt} justify-start items-center",
         )
 
     def settings_content(session):
-        curr_user = get_curr_user(session)
+        curr_user = get_curr_user(session, True)
+        if not curr_user:
+            return fh.Main(
+                fh.P(
+                    "User not found!",
+                    cls=f"text-2xl text-{error_color} hover:text-{error_hover_color}",
+                ),
+                cls=f"{page_ctnt} justify-center items-center",
+            )
         max_text_length_sm = 7
         max_text_length_md = 17
         return fh.Main(
@@ -1069,7 +1075,7 @@ def get_app():  # noqa: C901
                         fh.Div(
                             fh.Img(
                                 src=curr_user.profile_img,
-                                cls="w-12 h-12 object-cover rounded-full",
+                                cls="size-12 object-cover rounded-full",
                             ),
                             fh.Button(
                                 fh.P(
@@ -1079,7 +1085,7 @@ def get_app():  # noqa: C901
                                 ),
                                 spinner(
                                     id="edit-loader",
-                                    cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                                    cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                                 ),
                                 hx_get="/user/settings/edit",
                                 hx_target="#settings",
@@ -1140,7 +1146,7 @@ def get_app():  # noqa: C901
                         ),
                         spinner(
                             id="delete-account-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         hx_delete="/user/settings/delete-account",
                         hx_confirm="Are you sure you want to delete your account? This action cannot be undone.",
@@ -1159,12 +1165,13 @@ def get_app():  # noqa: C901
         return fh.Div(id="toast-container", cls="hidden")
 
     def footer():
+        curr_balance = get_curr_balance()
         return fh.Footer(
             fh.Div(
                 fh.Div(
                     fh.P("Global balance:", cls=f"text-{text_color}"),
                     fh.P(
-                        f"{GlobalBalanceRead.model_validate(get_curr_balance()).balance} credits",
+                        f"{curr_balance.balance} credits",
                         cls=f"text-{text_color} font-bold",
                         hx_ext="sse",
                         sse_connect="/stream-balance",
@@ -1189,7 +1196,7 @@ def get_app():  # noqa: C901
                         fh.NotStr(
                             si_github.svg,
                         ),
-                        cls=f"w-10 h-10 object-contain hover:{img_hover}",
+                        cls=f"size-10 object-contain hover:{img_hover}",
                     ),
                     href="https://github.com/andrewhinh/sim",
                     target="_blank",
@@ -1211,10 +1218,10 @@ def get_app():  # noqa: C901
     # helper fns
     async def stream_balance_updates():
         while not shutdown_event.is_set():
-            curr_balance = get_curr_balance().balance
+            curr_balance = get_curr_balance()
             global shown_balance
-            if shown_balance != curr_balance:
-                shown_balance = curr_balance
+            if shown_balance != curr_balance.balance:
+                shown_balance = curr_balance.balance
                 yield f"""event: UpdateBalance\ndata: {fh.to_xml(fh.P(f"{shown_balance} credits", cls=f"text-{text_color} font-bold", sse_swap="UpdateBalance"))}\n\n"""
             await sleep(1)
 
@@ -1238,15 +1245,15 @@ def get_app():  # noqa: C901
                     yield f"""event: UpdateTrials\ndata: {fh.to_xml(
                     spinner(
                             id=f"trial-{trial.uuid}-main-loader",
-                            sse_swap="UpdateTrial",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            sse_swap="UpdateTrials",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ) if curr_state == "loading" else
                     fh.Div(
                         fh.Svg(
                             fh.NotStr(
                                 """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" /></svg>"""
                             ),
-                            cls=f"w-6 h-6 text-{error_color} hover:text-{error_hover_color}",
+                            cls=f"size-6 text-{error_color} hover:text-{error_hover_color}",
                         ),
                         sse_swap="UpdateTrials",
                     ) if curr_state == "failed" else
@@ -1498,13 +1505,16 @@ def get_app():  # noqa: C901
     ## overlay
     @f_app.get("/user/overlay/show")
     def overlay_show(session):
-        curr_user = get_curr_user(session)
+        curr_user = get_curr_user(session, True)
+        if not curr_user:
+            fh.add_toast(session, "Refresh page", "error")
+            return
         max_username_length = 17
         return fh.Div(
             fh.Div(
                 fh.Img(
                     src=curr_user.profile_img,
-                    cls=f"w-10 h-10 object-cover hover:{img_hover} rounded-full",
+                    cls=f"size-10 object-cover hover:{img_hover} rounded-full",
                 ),
                 fh.P(
                     curr_user.username
@@ -1536,7 +1546,7 @@ def get_app():  # noqa: C901
                     ),
                     spinner(
                         id="logout-loader",
-                        cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                        cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     cls=f"w-full {click_button} {rounded} p-3",
                     hx_get="/auth/logout",
@@ -1551,12 +1561,15 @@ def get_app():  # noqa: C901
 
     @f_app.get("/user/overlay/close")
     def overlay_close(session):
-        curr_user = get_curr_user(session)
+        curr_user = get_curr_user(session, True)
+        if not curr_user:
+            fh.add_toast(session, "Refresh page", "error")
+            return
         max_username_length = 17
         return fh.Div(
             fh.Img(
                 src=curr_user.profile_img,
-                cls=f"w-10 h-10 object-cover hover:{img_hover} rounded-full",
+                cls=f"size-10 object-cover hover:{img_hover} rounded-full",
             ),
             fh.P(
                 curr_user.username
@@ -1643,11 +1656,12 @@ def get_app():  # noqa: C901
 
     @f_app.post("/trial")
     def sim_trial(session, question: str):
-        trial_create = TrialCreate(question=question)
-        trial = Trial.model_validate(trial_create)
         with get_db_session() as db_session:
-            trial.session_uuid = session["session_uuid"]
-            trial.user = get_curr_user(session)
+            trial = Trial(
+                question=question,
+                session_uuid=session["session_uuid"],
+                user=get_curr_user(session),
+            )
             db_session.add(trial)
             db_session.commit()
             db_session.refresh(trial)
@@ -1660,51 +1674,86 @@ def get_app():  # noqa: C901
             await ws.close()
             return
 
-        args = {"question": trial.question}
-        for i, (section_header, section_fn_name) in enumerate(section_to_fn.items()):
-            section_id = f"section-{uuid}-{i}"
-            await send(
-                section_view(section_header, "running", section_id),
-            )
-            args = process_section(section_fn_name, args)
-            status = "completed" if args else "failed"
-
-            if status == "completed" and section_header == "search_papers_threaded":
-                with get_db_session() as db_session:
-                    for paper in args:
-                        paper_create = PaperCreate(**paper)
-                        paper = Paper.model_validate(paper_create)
-                        paper.trial = trial
-                        db_session.add(paper)
-                        db_session.commit()
-                        db_session.refresh(paper)
-
-            await send(
-                section_view(section_header, status, section_id),
-            )
-            if not args:
-                with get_db_session() as db_session:
-                    trial = Trial.model_validate(trial)
-                    trial.success = False
-                    db_session.add(trial)
-                    db_session.commit()
-                    db_session.refresh(trial)
-                break
-
-        if args:
+        async def on_fail(trial: Trial):
             with get_db_session() as db_session:
-                trial = Trial.model_validate(trial)
-                trial.success = True
+                trial.success = False
                 db_session.add(trial)
                 db_session.commit()
                 db_session.refresh(trial)
-            await send(
-                fh.Div(
-                    id=f"trial-expanded-{trial.uuid}",
-                ),
-            )
+            await ws.close()
+            return
+
+        # create search parameters and search papers
+        await send(
+            section_view(sections[0], "running", f"section-{uuid}-0"),
+        )
+        search_params, papers = (
+            question_to_search_params_and_papers_threaded.local(trial.question)
+            if modal.is_local()
+            else question_to_search_params_and_papers_threaded.remote(trial.question)
+        )
+        status = "completed" if search_params and papers else "failed"
+        await send(
+            section_view(sections[0], status, f"section-{uuid}-0"),
+        )
+        if status == "completed":
+            with get_db_session() as db_session:
+                db_search_params = SearchParams(**search_params, trial=trial)
+                db_session.add(db_search_params)
+
+                db_papers = []
+                for paper in papers:
+                    paper = Paper(**paper)
+                    db_papers.append(paper)
+                db_session.add(trial)
+                trial.papers = db_papers
+
+                db_session.commit()
+                db_session.refresh(db_search_params)
+                db_session.refresh(trial)
+        else:
+            return await on_fail(trial)
+
+        # screen papers
+        await send(
+            section_view(sections[1], "running", f"section-{uuid}-1"),
+        )
+        papers = (
+            rerank_papers_threaded.local(trial.question, papers)
+            if modal.is_local()
+            else rerank_papers_threaded.remote(trial.question, papers)
+        )
+        status = "completed" if papers else "failed"
+        await send(
+            section_view(sections[1], status, f"section-{uuid}-1"),
+        )
+        if status == "completed" and len(papers) > 0:
+            with get_db_session() as db_session:
+                db_papers = []
+                for paper in papers:
+                    db_paper = Paper(**paper)
+                    db_papers.append(db_paper)
+                db_session.add(trial)
+                trial.papers = db_papers
+                db_session.commit()
+                db_session.refresh(trial)
+        else:
+            return await on_fail(trial)
+
+        # success
+        with get_db_session() as db_session:
+            trial.success = True
+            db_session.add(trial)
+            db_session.commit()
+            db_session.refresh(trial)
+        await send(
+            fh.Div(
+                id=f"trial-expanded-{trial.uuid}",
+            ),
+        )
 
         await ws.close()
+        return
 
     async def on_disconnect():
         pass
@@ -1712,16 +1761,6 @@ def get_app():  # noqa: C901
     @f_app.ws("/trial/ws/{uuid}", conn=on_connect, disconn=on_disconnect)
     async def trial_progress_ws():
         pass
-
-    def process_section(fn_name: str, args: dict) -> dict | None:
-        try:
-            fn = getattr(llm, fn_name)
-            if not fn:
-                return None
-            result = fn.local(**args) if modal.is_local() else fn.remote(**args)
-            return result
-        except Exception:
-            return None
 
     ## manage trials
     @f_app.get("/trials/{uuid}/stream")
@@ -1779,10 +1818,7 @@ def get_app():  # noqa: C901
                     shown_trials.pop(t.uuid, None)
             fh.add_toast(session, "Deleted trials.", "success")
             remain_trials = get_curr_trials(session)
-            remain_view = [
-                trial_view(TrialRead.model_validate(t), session)
-                for t in remain_trials[::-1]
-            ]
+            remain_view = [trial_view(t, session) for t in remain_trials[::-1]]
             return (
                 remain_view,
                 num_trials(session, "true"),
@@ -1811,10 +1847,10 @@ def get_app():  # noqa: C901
         session,
         trial_uuid: str,
     ):
+        trial = get_trial(session, trial_uuid)
+        if not trial:
+            return
         with get_db_session() as db_session:
-            trial = get_trial(session, trial_uuid)
-            if not trial:
-                return
             db_session.delete(trial)
             db_session.commit()
         global shown_trials
@@ -1877,16 +1913,17 @@ def get_app():  # noqa: C901
                 fh.add_toast(session, "User already exists", "error")
                 return fh.Redirect("/login")
             else:
+                user = UserCreate(
+                    login_type="email",
+                    profile_img=f"data:image/svg+xml;base64,{base64.b64encode(f'<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"50\" fill=\"{tailwind_to_hex[click_color]}\"/><text x=\"50\" y=\"60\" font-size=\"40\" text-anchor=\"middle\" fill=\"{tailwind_to_hex[text_color]}\" font-family=\"{font_hex}\">{email[0].upper()}</text></svg>'.encode()).decode()}",
+                    email=email,
+                    username=email,
+                )
                 extra_data = {
                     "hashed_password": pbkdf2_sha256.hash(password),
                 }
                 db_user = User.model_validate(
-                    {
-                        "login_type": "email",
-                        "profile_img": f"data:image/svg+xml;base64,{base64.b64encode(f'<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"50\" fill=\"{tailwind_to_hex[click_color]}\"/><text x=\"50\" y=\"60\" font-size=\"40\" text-anchor=\"middle\" fill=\"{tailwind_to_hex[text_color]}\" font-family=\"{font_hex}\">{email[0].upper()}</text></svg>'.encode()).decode()}",
-                        "email": email,
-                        "username": email,
-                    },
+                    user,
                     update=extra_data,
                 )
                 db_session.add(db_user)
@@ -1922,24 +1959,22 @@ def get_app():  # noqa: C901
                 )
                 return None
 
-            reset_token = str(uuid.uuid4())
-            with get_db_session() as db_session:
-                db_user.reset_token = reset_token
-                db_user.reset_token_expiry = datetime.now() + timedelta(
-                    hours=token_expiry
-                )
-                db_session.add(db_user)
-                db_session.commit()
-                db_session.refresh(db_user)
-            reset_link = f"{os.getenv('DOMAIN')}/reset-password?token={reset_token}"
-            send_password_reset_email(email, reset_link)
+            reset_token = uuid.uuid4()
+            db_user.reset_token = reset_token
+            db_user.reset_token_expiry = datetime.now() + timedelta(hours=token_expiry)
+            db_session.add(db_user)
+            db_session.commit()
+            db_session.refresh(db_user)
 
-            fh.add_toast(
-                session,
-                success_msg,
-                "success",
-            )
-            return fh.Redirect("/login")
+        reset_link = f"{os.getenv('DOMAIN')}/reset-password?token={reset_token}"
+        send_password_reset_email(email, reset_link)
+
+        fh.add_toast(
+            session,
+            success_msg,
+            "success",
+        )
+        return fh.Redirect("/login")
 
     @f_app.post("/auth/reset-password")
     def reset_password(session, password: str, confirm_password: str, token: str):
@@ -1972,8 +2007,9 @@ def get_app():  # noqa: C901
             db_session.add(db_user)
             db_session.commit()
             db_session.refresh(db_user)
-            fh.add_toast(session, "Password has been reset", "success")
-            return fh.Redirect("/login")
+
+        fh.add_toast(session, "Password has been reset", "success")
+        return fh.Redirect("/login")
 
     @f_app.get("/redirect-github")
     def redirect_github(code: str, request, session):
@@ -2002,8 +2038,8 @@ def get_app():  # noqa: C901
                 db_session.commit()
                 db_session.refresh(db_user)
 
-            session["user_uuid"] = db_user.uuid
-            return fh.RedirectResponse("/", status_code=303)
+        session["user_uuid"] = db_user.uuid
+        return fh.RedirectResponse("/", status_code=303)
 
     @f_app.get("/redirect-google")
     def redirect_google(code: str, request, session):
@@ -2032,13 +2068,16 @@ def get_app():  # noqa: C901
                 db_session.commit()
                 db_session.refresh(db_user)
 
-            session["user_uuid"] = db_user.uuid
-            return fh.RedirectResponse("/", status_code=303)
+        session["user_uuid"] = db_user.uuid
+        return fh.RedirectResponse("/", status_code=303)
 
     ## settings
     @f_app.get("/user/settings/edit")
     def edit_settings(session):
-        curr_user = get_curr_user(session)
+        curr_user = get_curr_user(session, True)
+        if not curr_user:
+            fh.add_toast(session, "Refresh page", "error")
+            return
         return (
             fh.Form(
                 fh.Div(
@@ -2059,12 +2098,12 @@ def get_app():  # noqa: C901
                         ),
                         fh.Img(
                             src=curr_user.profile_img,
-                            cls=f"hide-when-loading w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
+                            cls=f"hide-when-loading size-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
                             id="profile-img-preview",
                         ),
                         spinner(
                             id="profile-img-loader",
-                            cls=f"indicator w-12 h-12 text-{text_color} hover:text-{text_hover_color}",
+                            cls=f"indicator size-12 text-{text_color} hover:text-{text_hover_color}",
                         ),
                     ),
                     fh.Button(
@@ -2075,7 +2114,7 @@ def get_app():  # noqa: C901
                         ),
                         spinner(
                             id="save-loader",
-                            cls=f"indicator w-6 h-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         id="save-button",
                         type="submit",
@@ -2134,21 +2173,24 @@ def get_app():  # noqa: C901
         session,
         profile_img_file: fh.UploadFile,
     ):
-        curr_user = get_curr_user(session)
+        curr_user = get_curr_user(session, True)
+        if not curr_user:
+            fh.add_toast(session, "Refresh page", "error")
+            return
         res = validate_image_file(profile_img_file)
         if "error" in res.keys():
             fh.add_toast(session, res["error"], "error")
             return (
                 fh.Img(
                     src=curr_user.profile_img,
-                    cls=f"w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
+                    cls=f"size-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
                     id="profile-img-preview",
                 ),
             )
         return (
             fh.Img(
                 src=f"data:image/png;base64,{res['success']}",
-                cls=f"w-12 h-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
+                cls=f"size-12 object-cover rounded-full cursor-pointer hover:{img_hover}",
                 id="profile-img-preview",
             ),
         )
@@ -2168,6 +2210,9 @@ def get_app():  # noqa: C901
             fh.add_toast(session, "Username is required", "error")
             return None
         curr_user = get_curr_user(session)
+        if not curr_user:
+            fh.add_toast(session, "Refresh page", "error")
+            return None
         with get_db_session() as db_session:
             if email != curr_user.email:
                 query = select(User).where(User.email == email)
@@ -2175,6 +2220,7 @@ def get_app():  # noqa: C901
                 if db_user:
                     fh.add_toast(session, "Email already exists", "error")
                     return None
+                curr_user.email = email
 
             if username != curr_user.username:
                 query = select(User).where(User.username == username)
@@ -2182,12 +2228,12 @@ def get_app():  # noqa: C901
                 if db_user:
                     fh.add_toast(session, "Username already exists", "error")
                     return None
+                curr_user.username = username
 
-            curr_user.email = email
-            curr_user.username = username
             if curr_user.login_type == "email":
                 if password:
                     curr_user.hashed_password = pbkdf2_sha256.hash(password)
+
             if profile_img_file is not None and not profile_img_file.filename == "":
                 res = validate_image_file(profile_img_file)
                 if "error" in res.keys():
@@ -2198,6 +2244,7 @@ def get_app():  # noqa: C901
             db_session.add(curr_user)
             db_session.commit()
             db_session.refresh(curr_user)
+
         return fh.Redirect("/settings")
 
     @f_app.delete("/user/settings/delete-account")
@@ -2269,8 +2316,8 @@ def get_app():  # noqa: C901
             # session = event["data"]["object"]
             # print("Session completed", session)
             curr_balance = get_curr_balance()
-            curr_balance.balance += 5
             with get_db_session() as db_session:
+                curr_balance.balance += 5
                 db_session.add(curr_balance)
                 db_session.commit()
                 db_session.refresh(curr_balance)
@@ -2305,11 +2352,11 @@ f_app = get_app()
     timeout=5 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=1000)
 @modal.asgi_app()
 def modal_get():
     return f_app
 
 
 if __name__ == "__main__":
+    download_models()
     fh.serve(app="f_app")
