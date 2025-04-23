@@ -6,32 +6,32 @@ import smtplib
 import ssl
 import subprocess
 import tempfile
-import uuid
 from asyncio import sleep
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from uuid import uuid4
 
 import modal
 
 from db.models import (
+    DataPoint,
     GlobalBalance,
     Paper,
     SearchParams,
     Trial,
     User,
-    UserCreate,
-    UserRead,
     init_balance,
 )
 from src.llm import app as llm_app
 from src.llm import (
     check_question_threaded,
     download_models,
+    extract_data_points_threaded,
     modify_question_threaded,
-    question_to_search_params_and_papers_threaded,
+    question_to_query_and_papers_threaded,
     rerank_papers_threaded,
 )
 from utils import (
@@ -143,7 +143,9 @@ def get_app():  # noqa: C901
     # FastHTML setup
     def before(req, sess):
         if "session_uuid" not in sess:
-            req.scope["session_uuid"] = sess.setdefault("session_uuid", uuid.uuid4())
+            req.scope["session_uuid"] = sess.setdefault(
+                "session_uuid", str(uuid4())
+            )  # must be json-serializable
         if "user_uuid" not in sess:
             req.scope["user_uuid"] = sess.setdefault("user_uuid", "")
 
@@ -225,20 +227,24 @@ def get_app():  # noqa: C901
                 db_session.refresh(curr_balance)
             return curr_balance
 
-    def get_curr_user(session, read: bool = False) -> User | None:
+    def get_curr_user(session) -> User | None:
         if session["user_uuid"]:
             with get_db_session() as db_session:
                 query = select(User).where(User.uuid == session["user_uuid"])
                 curr_user = db_session.exec(query).first()
                 if not curr_user:
                     return None
-                return curr_user if read else UserRead.model_validate(curr_user)
+                return curr_user
         return None
 
     def get_curr_trials(session) -> list[Trial]:
-        curr_user = get_curr_user(session, True)
-        if curr_user:
-            return curr_user.trials
+        if session["user_uuid"]:
+            with get_db_session() as db_session:
+                query = select(User).where(User.uuid == session["user_uuid"])
+                curr_user = db_session.exec(query).first()
+                if not curr_user:
+                    return []
+                return curr_user.trials
         return []
 
     def get_trial(session, uuid: str) -> Trial | None:
@@ -304,6 +310,7 @@ def get_app():  # noqa: C901
             ),
         )
 
+    ## trial manage page
     def trial_view(
         trial: Trial,
     ):
@@ -366,50 +373,6 @@ def get_app():  # noqa: C901
                 ),
                 cls="flex grow",
             ),
-        )
-
-    def section_view(
-        section: str,
-        status: str = "pending",
-        section_id: str = "",
-    ):
-        status_elements = {
-            "pending": fh.Svg(
-                fh.NotStr(
-                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/>
-                    </svg>""",
-                ),
-                cls=f"size-6 text-{text_color}",
-            ),
-            "running": spinner(
-                cls=f"size-6 text-{text_color} hover:text-{text_button_hover_color}",
-            ),
-            "completed": fh.Svg(
-                fh.NotStr(
-                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                        <path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" fill="currentColor"/>
-                    </svg>"""
-                ),
-                cls=f"size-6 text-{click_color}",
-            ),
-            "failed": fh.Svg(
-                fh.NotStr(
-                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                        <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" fill="currentColor"/>
-                    </svg>"""
-                ),
-                cls=f"size-6 text-{error_color}",
-            ),
-        }
-        return fh.Div(
-            status_elements.get(status, status_elements["pending"]),
-            fh.P(
-                section,
-                cls=f"text-md text-{text_color}",
-            ),
-            id=section_id,
-            cls="w-full md:w-2/3 flex justify-start items-center gap-12 md:gap-16",
         )
 
     def num_trials(session, hx_swap_oob: str = "false"):
@@ -512,6 +475,75 @@ def get_app():  # noqa: C901
             id="load-more-trials",
             hx_swap_oob=hx_swap_oob if hx_swap_oob != "false" else None,
             cls="w-full md:w-2/3",
+        )
+
+    ## single trial
+
+    def section_view(
+        section: str,
+        status: str = "pending",
+        section_id: str = "",
+    ):
+        status_elements = {
+            "pending": fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" fill="none"/>
+                    </svg>""",
+                ),
+                cls=f"size-6 text-{text_color}",
+            ),
+            "running": spinner(
+                cls=f"size-6 text-{text_color} hover:text-{text_button_hover_color}",
+            ),
+            "completed": fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" fill="currentColor"/>
+                    </svg>"""
+                ),
+                cls=f"size-6 text-{click_color}",
+            ),
+            "failed": fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" fill="currentColor"/>
+                    </svg>"""
+                ),
+                cls=f"size-6 text-{error_color}",
+            ),
+        }
+        return fh.Div(
+            status_elements.get(status, status_elements["pending"]),
+            fh.P(
+                section,
+                cls=f"text-md text-{text_color}",
+            ),
+            id=section_id,
+            cls="w-full md:w-2/3 flex justify-start items-center gap-12 md:gap-16",
+        )
+
+    def trial_expanded(trial: Trial):
+        return (
+            fh.Div(
+                id=f"trial-visualization-{trial.uuid}",
+            )
+            if trial.success is True
+            else fh.Div(
+                *[
+                    section_view(
+                        section,
+                        "pending",
+                        f"section-{trial.uuid}-{i}",
+                    )
+                    for i, section in enumerate(sections)
+                ],
+                id=f"trial-visualization-{trial.uuid}",
+                hx_ext="ws",
+                ws_connect=f"/trial/ws/{trial.uuid}",
+                hx_trigger="load",
+                cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-start items-end pt-8 gap-8 md:gap-12",
+            ),
         )
 
     # ui layout
@@ -1034,26 +1066,12 @@ def get_app():  # noqa: C901
                 ),
                 cls="w-full md:w-2/3 h-1/3 flex flex-col grow justify-center items-center",
             ),
-            fh.Div(
-                *[
-                    section_view(
-                        section,
-                        "pending",
-                        f"section-{trial.uuid}-{i}",
-                    )
-                    for i, section in enumerate(sections)
-                ],
-                id=f"trial-expanded-{trial.uuid}",
-                hx_ext="ws",
-                ws_connect=f"/trial/ws/{trial.uuid}",
-                hx_trigger="load",
-                cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-start items-end pt-8 gap-8 md:gap-12",
-            ),
+            trial_expanded(trial),
             cls=f"{page_ctnt} justify-start items-center",
         )
 
     def settings_content(session):
-        curr_user = get_curr_user(session, True)
+        curr_user = get_curr_user(session)
         if not curr_user:
             return fh.Main(
                 fh.P(
@@ -1505,7 +1523,7 @@ def get_app():  # noqa: C901
     ## overlay
     @f_app.get("/user/overlay/show")
     def overlay_show(session):
-        curr_user = get_curr_user(session, True)
+        curr_user = get_curr_user(session)
         if not curr_user:
             fh.add_toast(session, "Refresh page", "error")
             return
@@ -1561,7 +1579,7 @@ def get_app():  # noqa: C901
 
     @f_app.get("/user/overlay/close")
     def overlay_close(session):
-        curr_user = get_curr_user(session, True)
+        curr_user = get_curr_user(session)
         if not curr_user:
             fh.add_toast(session, "Refresh page", "error")
             return
@@ -1670,16 +1688,15 @@ def get_app():  # noqa: C901
     async def on_connect(session, ws, send):
         uuid = ws.path_params["uuid"]
         trial = get_trial(session, uuid)
-        if not trial:
-            await ws.close()
-            return
 
+        # on fail
         async def on_fail(trial: Trial):
             with get_db_session() as db_session:
                 trial.success = False
                 db_session.add(trial)
                 db_session.commit()
                 db_session.refresh(trial)
+            await send(trial_expanded(trial))
             await ws.close()
             return
 
@@ -1688,9 +1705,9 @@ def get_app():  # noqa: C901
             section_view(sections[0], "running", f"section-{uuid}-0"),
         )
         search_params, papers = (
-            question_to_search_params_and_papers_threaded.local(trial.question)
+            question_to_query_and_papers_threaded.local(trial.question)
             if modal.is_local()
-            else question_to_search_params_and_papers_threaded.remote(trial.question)
+            else question_to_query_and_papers_threaded.remote(trial.question)
         )
         status = "completed" if search_params and papers else "failed"
         await send(
@@ -1727,7 +1744,7 @@ def get_app():  # noqa: C901
         await send(
             section_view(sections[1], status, f"section-{uuid}-1"),
         )
-        if status == "completed" and len(papers) > 0:
+        if status == "completed":
             with get_db_session() as db_session:
                 db_papers = []
                 for paper in papers:
@@ -1740,18 +1757,42 @@ def get_app():  # noqa: C901
         else:
             return await on_fail(trial)
 
+        # extract data points
+        await send(
+            section_view(sections[2], "running", f"section-{uuid}-2"),
+        )
+        data_points = (
+            extract_data_points_threaded.local(papers)
+            if modal.is_local()
+            else extract_data_points_threaded.remote(papers)
+        )
+        status = "completed" if data_points else "failed"
+        await send(
+            section_view(sections[2], status, f"section-{uuid}-2"),
+        )
+        if status == "completed":
+            with get_db_session() as db_session:
+                for paper, data_points in zip(papers, data_points):
+                    db_data_points = []
+                    for data_point in data_points:
+                        db_data_point = DataPoint(**data_point)
+                        db_data_points.append(db_data_point)
+                    db_session.add(paper)
+                    paper.data_points = db_data_points
+                db_session.add(trial)
+                trial.papers = papers
+                db_session.commit()
+                db_session.refresh(trial)
+        else:
+            return await on_fail(trial)
+
         # success
         with get_db_session() as db_session:
             trial.success = True
             db_session.add(trial)
             db_session.commit()
             db_session.refresh(trial)
-        await send(
-            fh.Div(
-                id=f"trial-expanded-{trial.uuid}",
-            ),
-        )
-
+        await send(trial_expanded(trial))
         await ws.close()
         return
 
@@ -1888,7 +1929,6 @@ def get_app():  # noqa: C901
             query = select(User).where(User.email == email)
             db_user = db_session.exec(query).first()
             if not db_user:
-                fh.add_toast(session, "User not found", "error")
                 return fh.Redirect("/signup")
             else:
                 if not pbkdf2_sha256.verify(password, db_user.hashed_password):
@@ -1910,21 +1950,14 @@ def get_app():  # noqa: C901
             query = select(User).where(User.email == email)
             db_user = db_session.exec(query).first()
             if db_user:
-                fh.add_toast(session, "User already exists", "error")
                 return fh.Redirect("/login")
             else:
-                user = UserCreate(
+                db_user = User(
                     login_type="email",
                     profile_img=f"data:image/svg+xml;base64,{base64.b64encode(f'<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"><circle cx=\"50\" cy=\"50\" r=\"50\" fill=\"{tailwind_to_hex[click_color]}\"/><text x=\"50\" y=\"60\" font-size=\"40\" text-anchor=\"middle\" fill=\"{tailwind_to_hex[text_color]}\" font-family=\"{font_hex}\">{email[0].upper()}</text></svg>'.encode()).decode()}",
                     email=email,
                     username=email,
-                )
-                extra_data = {
-                    "hashed_password": pbkdf2_sha256.hash(password),
-                }
-                db_user = User.model_validate(
-                    user,
-                    update=extra_data,
+                    hashed_password=pbkdf2_sha256.hash(password),
                 )
                 db_session.add(db_user)
                 db_session.commit()
@@ -1939,19 +1972,11 @@ def get_app():  # noqa: C901
             return None
 
         token_expiry = 24  # hours
-        success_msg = (
-            "If an account with that email exists, a password reset link has been sent."
-        )
 
         with get_db_session() as db_session:
             query = select(User).where(User.email == email)
             db_user = db_session.exec(query).first()
             if not db_user:
-                fh.add_toast(
-                    session,
-                    success_msg,
-                    "success",
-                )
                 return fh.Redirect("/login")
             if db_user.login_type != "email":
                 fh.add_toast(
@@ -1959,7 +1984,7 @@ def get_app():  # noqa: C901
                 )
                 return None
 
-            reset_token = uuid.uuid4()
+            reset_token = str(uuid4())
             db_user.reset_token = reset_token
             db_user.reset_token_expiry = datetime.now() + timedelta(hours=token_expiry)
             db_session.add(db_user)
@@ -1969,11 +1994,6 @@ def get_app():  # noqa: C901
         reset_link = f"{os.getenv('DOMAIN')}/reset-password?token={reset_token}"
         send_password_reset_email(email, reset_link)
 
-        fh.add_toast(
-            session,
-            success_msg,
-            "success",
-        )
         return fh.Redirect("/login")
 
     @f_app.post("/auth/reset-password")
@@ -1988,17 +2008,14 @@ def get_app():  # noqa: C901
             fh.add_toast(session, "Passwords do not match", "error")
             return None
         if not token:
-            fh.add_toast(session, "Invalid reset token", "error")
             return fh.Redirect("/login")
 
         with get_db_session() as db_session:
             query = select(User).where(User.reset_token == token)
             db_user = db_session.exec(query).first()
             if not db_user:
-                fh.add_toast(session, "Invalid reset token", "error")
                 return fh.Redirect("/login")
             if db_user.reset_token_expiry < datetime.now():
-                fh.add_toast(session, "Reset token has expired", "error")
                 return fh.Redirect("/login")
 
             db_user.hashed_password = pbkdf2_sha256.hash(password)
@@ -2008,13 +2025,16 @@ def get_app():  # noqa: C901
             db_session.commit()
             db_session.refresh(db_user)
 
-        fh.add_toast(session, "Password has been reset", "success")
         return fh.Redirect("/login")
 
     @f_app.get("/redirect-github")
-    def redirect_github(code: str, request, session):
-        if not code:
-            fh.add_toast(session, "Invalid code", "error")
+    def redirect_github(
+        request,
+        session,
+        code: str | None = None,
+        error: str | None = None,
+    ):
+        if not code or error:
             return fh.Redirect("/login")
 
         redir = redir_url(request, "/redirect-github")
@@ -2042,9 +2062,13 @@ def get_app():  # noqa: C901
         return fh.RedirectResponse("/", status_code=303)
 
     @f_app.get("/redirect-google")
-    def redirect_google(code: str, request, session):
-        if not code:
-            fh.add_toast(session, "Invalid code", "error")
+    def redirect_google(
+        request,
+        session,
+        code: str | None = None,
+        error: str | None = None,
+    ):
+        if not code or error:
             return fh.Redirect("/login")
 
         redir = redir_url(request, "/redirect-google")
@@ -2074,7 +2098,7 @@ def get_app():  # noqa: C901
     ## settings
     @f_app.get("/user/settings/edit")
     def edit_settings(session):
-        curr_user = get_curr_user(session, True)
+        curr_user = get_curr_user(session)
         if not curr_user:
             fh.add_toast(session, "Refresh page", "error")
             return
@@ -2173,7 +2197,7 @@ def get_app():  # noqa: C901
         session,
         profile_img_file: fh.UploadFile,
     ):
-        curr_user = get_curr_user(session, True)
+        curr_user = get_curr_user(session)
         if not curr_user:
             fh.add_toast(session, "Refresh page", "error")
             return

@@ -7,7 +7,7 @@ import modal
 import requests
 from pydantic import BaseModel
 
-from db.models import PaperBase, SearchParamsBase
+from db.models import DataPointBase, PaperBase, SearchParamsBase
 from utils import (
     APP_NAME,
     CPU,
@@ -39,21 +39,38 @@ else:
 
 small_llm_name = "Qwen/Qwen2.5-3B-Instruct-AWQ"
 small_llm_enforce_eager = False
-small_llm_max_num_seqs = 1
+small_llm_max_num_seqs = 1 if modal.is_local() else 1024
 small_llm_trust_remote_code = True
 small_llm_max_model_len = 32768
+small_llm_enable_chunked_prefill = True
+small_llm_max_num_batched_tokens = small_llm_max_model_len
 
 medium_llm_name = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
 medium_llm_enforce_eager = False
-medium_llm_max_num_seqs = 1
+medium_llm_max_num_seqs = 1 if modal.is_local() else 512
 medium_llm_trust_remote_code = True
 medium_llm_max_model_len = 32768
+medium_llm_enable_chunked_prefill = True
+medium_llm_max_num_batched_tokens = medium_llm_max_model_len
 
 reranker_name = "answerdotai/answerai-colbert-small-v1"
 
+large_llm_name = (
+    "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+    if modal.is_local()
+    else "google/gemma-3-27b-it"
+)  # google/gemma-3-27b-it-qat-q4_0-gguf
+
+large_llm_enforce_eager = False
+large_llm_max_num_seqs = 1 if modal.is_local() else 4
+large_llm_trust_remote_code = True
+large_llm_max_model_len = 32768 if modal.is_local() else 131072
+large_llm_enable_chunked_prefill = True
+large_llm_max_num_batched_tokens = large_llm_max_model_len
+
 
 def download_models():
-    for llm_name in [small_llm_name, medium_llm_name, reranker_name]:
+    for llm_name in [small_llm_name, medium_llm_name, reranker_name, large_llm_name]:
         snapshot_download(
             repo_id=llm_name,
             local_dir=PRETRAINED_VOL_PATH,
@@ -114,10 +131,6 @@ with GPU_IMAGE.imports():
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
-class CheckQuestion(BaseModel):
-    suggestions: list[str] | None
-
-
 @app.function(
     image=GPU_IMAGE,
     cpu=CPU,
@@ -128,7 +141,7 @@ class CheckQuestion(BaseModel):
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=20)
+@modal.concurrent(max_inputs=small_llm_max_num_seqs)
 def check_question_threaded(question: str) -> list[str] | None:
     max_num_suggestions = 3
 
@@ -141,6 +154,8 @@ def check_question_threaded(question: str) -> list[str] | None:
         tensor_parallel_size=torch.cuda.device_count(),
         trust_remote_code=small_llm_trust_remote_code,
         max_model_len=small_llm_max_model_len,
+        enable_chunked_prefill=small_llm_enable_chunked_prefill,
+        max_num_batched_tokens=small_llm_max_num_batched_tokens,
     )
 
     system_prompt = """
@@ -189,7 +204,11 @@ def check_question_threaded(question: str) -> list[str] | None:
     top_p = 0.8
     repetition_penalty = 1.05
     stop_token_ids = []
-    max_tokens = 512
+    max_tokens = 256
+
+    class CheckQuestion(BaseModel):
+        suggestions: list[str] | None
+
     guided_decoding = GuidedDecodingParams(json=CheckQuestion.model_json_schema())
     sampling_params = SamplingParams(
         temperature=temperature,
@@ -237,7 +256,7 @@ def check_question_threaded(question: str) -> list[str] | None:
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=20)
+@modal.concurrent(max_inputs=small_llm_max_num_seqs)
 def modify_question_threaded(question: str, suggestion: str) -> str:
     small_llm = LLM(
         download_dir=PRETRAINED_VOL_PATH,
@@ -248,6 +267,8 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
         tensor_parallel_size=torch.cuda.device_count(),
         trust_remote_code=small_llm_trust_remote_code,
         max_model_len=small_llm_max_model_len,
+        enable_chunked_prefill=small_llm_enable_chunked_prefill,
+        max_num_batched_tokens=small_llm_max_num_batched_tokens,
     )
 
     system_prompt = """
@@ -293,8 +314,7 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
     repetition_penalty = 1.05
     stop_token_ids = []
     max_tokens = 512
-
-    modify_sampling_params = SamplingParams(
+    sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
         repetition_penalty=repetition_penalty,
@@ -313,7 +333,7 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
             },
         ]
     ]
-    outputs = small_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
+    outputs = small_llm.chat(conversations, sampling_params, use_tqdm=True)
     generated_text = outputs[0].outputs[0].text.strip().strip('"')
     return generated_text
 
@@ -321,158 +341,11 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
 @app.function(
     image=GPU_IMAGE,
     cpu=CPU,
-    memory=MEM,
-    gpu="l40s:1",
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=100)
-def question_to_search_params_and_papers_threaded(
-    question: str,
-    min_results: int = 10,
-    max_results: int = 100,
-) -> tuple[str, list[dict]]:  # search params, papers
-    medium_llm = LLM(
-        download_dir=PRETRAINED_VOL_PATH,
-        model=medium_llm_name,
-        tokenizer=medium_llm_name,
-        enforce_eager=medium_llm_enforce_eager,
-        max_num_seqs=medium_llm_max_num_seqs,
-        tensor_parallel_size=torch.cuda.device_count(),
-        trust_remote_code=medium_llm_trust_remote_code,
-        max_model_len=medium_llm_max_model_len,
-    )
-
-    system_prompt = """
-        You are a specialized academic search expert who transforms research questions into an effective search query for the Semantic Scholar Paper bulk search API.
-        Your output should ONLY be the search query with no additional explanations.
-    """
-    user_prompt = f"""
-        Original research question: "{question}"
-        
-        Task: Convert this research question into an effective search query for the Semantic Scholar Paper bulk search API.
-
-        query:
-        - Will be matched against the paper's title and abstract.
-        - All terms are stemmed in English.
-        - By default all terms in the query must be present in the paper.
-        - The match query supports the following syntax:
-            - + for AND operation
-            - | for OR operation
-            - - negates a term
-            - " collects terms into a phrase
-            - * can be used to match a prefix
-            - ( and ) for precedence
-            - ~N after a word matches within the edit distance of N (Defaults to 2 if N is omitted)
-            - ~N after a phrase matches with the phrase terms separated up to N terms apart (Defaults to 2 if N is omitted)
-        - examples:
-            - fish ladder matches papers that contain "fish" and "ladder"
-            - fish -ladder matches papers that contain "fish" but not "ladder"
-            - fish | ladder matches papers that contain "fish" or "ladder"
-            - "fish ladder" matches papers that contain the phrase "fish ladder"
-            - (fish ladder) | outflow matches papers that contain "fish" and "ladder" OR "outflow"
-            - fish~ matches papers that contain "fish", "fist", "fihs", etc.
-            - "fish ladder"~3 matches papers that contain the phrase "fish ladder" or "fish is on a ladder"
-
-        Ensure your query is broad enough to return at least {min_results} results.
-        Do so by using the minimum number of terms and broad operators.
-
-        Return ONLY the search query without additional text.
-
-        If your parameters do not return at least {min_results} results, your query is too narrow.
-        To broaden your query, try:
-        - using more '|' (OR) operators
-        - using less '+' (AND) operators
-        - removing unnecessary query terms
-        - etc.
-    """
-
-    temperature = 0.0
-    top_p = 0.8
-    repetition_penalty = 1.05
-    stop_token_ids = []
-    max_tokens = 512
-
-    modify_sampling_params = SamplingParams(
-        temperature=temperature,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        stop_token_ids=stop_token_ids,
-        max_tokens=max_tokens,
-    )
-
-    conversations = [
-        [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_prompt},
-                ],
-            },
-        ]
-    ]
-
-    # retries in case no results
-    num_retries = 3
-    for i in range(num_retries):
-        outputs = medium_llm.chat(conversations, modify_sampling_params, use_tqdm=True)
-        generated_text = outputs[0].outputs[0].text.strip()
-
-        search_params = SearchParamsBase.model_validate({"query": generated_text})
-        search_params_dict = search_params.model_dump()
-        papers = (
-            search_papers_threaded.local(**search_params_dict)
-            if modal.is_local()
-            else search_papers_threaded.remote(**search_params_dict)
-        )
-        if len(papers) >= min_results:
-            break
-        else:
-            if i == num_retries - 1:
-                print(
-                    f"Warning: Skipping search for question {question} due to too few results"
-                )
-                search_params_dict = {}
-                papers = []
-            else:
-                conversations[0].append(
-                    {
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": generated_text}],
-                    }
-                )
-                conversations[0].append(
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"Error: Need {min_results} papers, only {len(papers)} found using these parameters: {generated_text}. "
-                                    "Please reformulate the search parameters for broader coverage and return only the JSON with new parameters."
-                                ),
-                            },
-                        ],
-                    }
-                )
-
-    return search_params_dict, papers[:max_results]
-
-
-@app.function(
-    image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
-    gpu="l40s:1",
-    volumes=VOLUME_CONFIG,
-    secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
-)
-@modal.concurrent(max_inputs=1000)
 def search_papers_threaded(
     query: str,
     max_results: int = 50,
@@ -528,24 +401,163 @@ def search_papers_threaded(
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=100)
-def paper_to_text(paper: dict) -> str | None:
+@modal.concurrent(max_inputs=medium_llm_max_num_seqs)
+def question_to_query_and_papers_threaded(
+    question: str,
+    min_results: int = 10,
+    max_results: int = 100,
+) -> tuple[dict, list[dict]]:  # search params, papers
+    medium_llm = LLM(
+        download_dir=PRETRAINED_VOL_PATH,
+        model=medium_llm_name,
+        tokenizer=medium_llm_name,
+        enforce_eager=medium_llm_enforce_eager,
+        max_num_seqs=medium_llm_max_num_seqs,
+        tensor_parallel_size=torch.cuda.device_count(),
+        trust_remote_code=medium_llm_trust_remote_code,
+        max_model_len=medium_llm_max_model_len,
+        enable_chunked_prefill=medium_llm_enable_chunked_prefill,
+        max_num_batched_tokens=medium_llm_max_num_batched_tokens,
+    )
+
+    system_prompt = """
+        You are a specialized academic search expert who transforms research questions into an effective search query for the Semantic Scholar Paper bulk search API.
+        Your output should ONLY be the search query with no additional explanations.
+    """
+    user_prompt = f"""
+        Original research question: "{question}"
+        
+        Task: Convert this research question into an effective search query for the Semantic Scholar Paper bulk search API.
+
+        query:
+        - Will be matched against the paper's title and abstract.
+        - All terms are stemmed in English.
+        - By default all terms in the query must be present in the paper.
+        - The match query supports the following syntax:
+            - + for AND operation
+            - | for OR operation
+            - - negates a term
+            - " collects terms into a phrase
+            - * can be used to match a prefix
+            - ( and ) for precedence
+            - ~N after a word matches within the edit distance of N (Defaults to 2 if N is omitted)
+            - ~N after a phrase matches with the phrase terms separated up to N terms apart (Defaults to 2 if N is omitted)
+        - examples:
+            - fish ladder matches papers that contain "fish" and "ladder"
+            - fish -ladder matches papers that contain "fish" but not "ladder"
+            - fish | ladder matches papers that contain "fish" or "ladder"
+            - "fish ladder" matches papers that contain the phrase "fish ladder"
+            - (fish ladder) | outflow matches papers that contain "fish" and "ladder" OR "outflow"
+            - fish~ matches papers that contain "fish", "fist", "fihs", etc.
+            - "fish ladder"~3 matches papers that contain the phrase "fish ladder" or "fish is on a ladder"
+
+        Ensure your query is broad enough to return at least {min_results} results.
+        Do so by using the minimum number of terms and broad operators.
+
+        Return ONLY the search query without additional text.
+
+        If your parameters do not return at least {min_results} results, your query is too narrow.
+        To broaden your query, try:
+        - using more '|' (OR) operators
+        - using less '+' (AND) operators
+        - removing unnecessary query terms
+        - etc.
+    """
+
+    temperature = 0.0
+    top_p = 0.8
+    repetition_penalty = 1.05
+    stop_token_ids = []
+    max_tokens = 512
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+    )
+
+    # retries in case no results
+    conversations = [
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                ],
+            },
+        ]
+    ]
+    num_retries = 3
+    for i in range(num_retries):
+        outputs = medium_llm.chat(conversations, sampling_params, use_tqdm=True)
+        generated_text = outputs[0].outputs[0].text.strip()
+
+        search_params = SearchParamsBase.model_validate({"query": generated_text})
+        search_params_dict = search_params.model_dump()
+        papers = (
+            search_papers_threaded.local(**search_params_dict)
+            if modal.is_local()
+            else search_papers_threaded.remote(**search_params_dict)
+        )
+        if len(papers) >= min_results:
+            break
+        else:
+            if i == num_retries - 1:
+                print(
+                    f"Warning: Skipping search for question {question} due to too few results"
+                )
+                search_params_dict = {}
+                papers = []
+            else:
+                conversations[0].append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": generated_text}],
+                    }
+                )
+                conversations[0].append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"Error: Need {min_results} papers, only {len(papers)} found using these parameters: {generated_text}. "
+                                    "Please reformulate the search parameters for broader coverage and return only the JSON with new parameters."
+                                ),
+                            },
+                        ],
+                    }
+                )
+
+    return search_params_dict, papers[:max_results]
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    volumes=VOLUME_CONFIG,
+    secrets=SECRETS,
+    timeout=2 * MINUTES,
+    scaledown_window=15 * MINUTES,
+)
+def paper_to_chunks(paper: dict) -> list[str] | None:
     try:
         open_access_pdf = paper.get("open_access_pdf", {})
         if not open_access_pdf:
-            return None
+            raise ValueError("Paper has no open access PDF")
         pdf_url = open_access_pdf.get("url", "")
         if not pdf_url:
-            return None
+            raise ValueError("Paper has no open access PDF URL")
 
         # check pdf
         resp = requests.get(pdf_url)
         content_type = resp.headers.get("Content-Type", "").lower()
         if "pdf" not in content_type:
-            print(
-                f"Warning: Skipping paper {paper.get('paper_id', 'unknown')} because Content-Type is not PDF: {content_type}"
-            )
-            return None
+            raise ValueError(f"Paper has invalid Content-Type: {content_type}")
         resp.raise_for_status()
 
         with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
@@ -555,22 +567,19 @@ def paper_to_text(paper: dict) -> str | None:
             with open(tmp_file.name, "rb") as f:
                 magic = f.read(4)
             if magic != b"%PDF":
-                print(
-                    f"Warning: Skipping paper {paper.get('paper_id', 'unknown')} because file magic number is not %PDF"
-                )
-                return None
+                raise ValueError("Paper is not a valid PDF")
 
-            text = "\n\n".join(
-                [
-                    element.text
-                    for element in partition_pdf(
-                        tmp_file.name,
-                        url=None,
-                    )
-                ]
+            chunk_elements = partition_pdf(
+                tmp_file.name,
+                url=None,
+                chunking_strategy="by_title",
+                max_characters=large_llm_max_model_len
+                // 2,  # hard limit with retries in mind (roughly 4x chars -> 1 token)
+                new_after_n_chars=large_llm_max_model_len // 4,  # soft limit
             )
 
-        return text
+        chunks = [element.text for element in chunk_elements]
+        return chunks
     except Exception as e:
         print(
             f"Warning: Skipping paper {paper.get('paper_id', 'unknown')} due to error: {e}"
@@ -588,7 +597,6 @@ def paper_to_text(paper: dict) -> str | None:
     timeout=2 * MINUTES,
     scaledown_window=15 * MINUTES,
 )
-@modal.concurrent(max_inputs=100)
 def rerank_papers_threaded(
     question: str, papers: list[dict], max_results: int = 50
 ) -> list[dict]:
@@ -602,17 +610,22 @@ def rerank_papers_threaded(
         batch_size=16,
         model_kwargs={"cache_dir": PRETRAINED_VOL_PATH},
     )
+
     if modal.is_local():
-        texts = list(
-            tqdm(thread_map(paper_to_text.local, papers), desc="Processing papers")
+        chunk_lists = list(
+            tqdm(thread_map(paper_to_chunks.local, papers), desc="Processing papers")
         )
     else:
-        texts = list(paper_to_text.map(papers))
+        chunk_lists = list(paper_to_chunks.map(papers))
 
-    filtered = [(text, idx) for text, idx in zip(texts, paper_idxs) if text is not None]
+    filtered = [
+        (chunks, idx)
+        for chunks, idx in zip(chunk_lists, paper_idxs)
+        if chunks is not None
+    ]
     if not filtered:
         return []
-    texts, paper_idxs = zip(*filtered)
+    chunk_lists, paper_idxs = zip(*filtered)
     docs = [
         f"""
             Title: {paper.get("title", "")}
@@ -623,7 +636,7 @@ def rerank_papers_threaded(
             Reference Count: {paper.get("reference_count", "")}
             Citation Count: {paper.get("citation_count", "")}
             Influential Citation Count: {paper.get("influential_citation_count", "")}
-            Text: {text}
+            Text: {"\n\n".join(chunks)}
             Fields of Study: {paper.get("fields_of_study", "")}
             Publication Types: {paper.get("publication_types", "")}
             Publication Date: {paper.get("publication_date", "")}
@@ -641,7 +654,7 @@ def rerank_papers_threaded(
                 ]
             )}
         """
-        for paper, text in zip(papers, texts)
+        for paper, chunks in zip(papers, chunk_lists)
     ]
 
     results = ranker.rank(query=question, docs=docs)
@@ -649,9 +662,155 @@ def rerank_papers_threaded(
     screened_papers = []
     for i in top_k_idxs:
         paper = papers[paper_idxs[i]]
-        paper["text"] = texts[i]
+        paper["chunks"] = chunk_lists[i]
         screened_papers.append(paper)
     return screened_papers
+
+
+@app.function(
+    image=GPU_IMAGE,
+    cpu=CPU,
+    memory=MEM,
+    gpu="h100:1",
+    volumes=VOLUME_CONFIG,
+    secrets=SECRETS,
+    timeout=4 * MINUTES,
+    scaledown_window=15 * MINUTES,
+)
+@modal.concurrent(max_inputs=large_llm_max_num_seqs)
+def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
+    large_llm = LLM(
+        download_dir=PRETRAINED_VOL_PATH,
+        model=large_llm_name,
+        tokenizer=large_llm_name,
+        enforce_eager=large_llm_enforce_eager,
+        max_num_seqs=large_llm_max_num_seqs,
+        tensor_parallel_size=torch.cuda.device_count(),
+        trust_remote_code=large_llm_trust_remote_code,
+        max_model_len=large_llm_max_model_len,
+        enable_chunked_prefill=large_llm_enable_chunked_prefill,
+        max_num_batched_tokens=large_llm_max_num_batched_tokens,
+    )
+
+    system_prompt = """
+        You are a specialized research methodology expert that extracts key data points from academic papers.
+        Your ONLY task is to extract key data points from academic papers and return a structured JSON response in the EXACT format required. 
+        Do not deviate from the response format under any circumstances.
+        Your output should ONLY be the data points with no additional explanations.
+    """
+    user_prompt = """
+        Task: Given this chunk of text from an academic paper below, extract all relevant data points and format them as per the schema described.
+
+        Paper content:
+        {paper}
+
+        Use the following schema for each data point:
+        - name: string (the name of the metric or measurement)
+        - value: number (the numeric result or measurement)
+        - unit: string or null (unit of measurement)
+        - excerpt: string or null (text snippet where the data point occurs)
+
+        The final output must be a JSON array of objects, for example:
+        [
+            {{
+                "name": "average response time",
+                "value": 123.45,
+                "unit": "ms",
+                "excerpt": "The mean response time was 123.45 ms across all trials."
+            }},
+            {{
+                "name": "sample size",
+                "value": 200,
+                "unit": "participants",
+                "excerpt": "A total of 200 participants were recruited for the study."
+            }}
+        ]
+
+        Return only a JSON array of objects conforming to the schema with no additional text.
+
+        If there are no data points, return an empty array.
+    """
+
+    temperature = 0.0
+    top_p = 0.8
+    repetition_penalty = 1.05
+    stop_token_ids = []
+    max_tokens = 8192
+    guided_decoding = GuidedDecodingParams(
+        json={"type": "array", "items": DataPointBase.model_json_schema()}
+    )
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        repetition_penalty=repetition_penalty,
+        stop_token_ids=stop_token_ids,
+        max_tokens=max_tokens,
+        guided_decoding=guided_decoding,
+    )
+
+    data_points_all: list[list[dict]] = []
+    for paper in papers:
+        paper_points: list[dict] = []
+        for idx, chunk in enumerate(paper["chunks"]):
+            conversation = [
+                [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": user_prompt.format(paper=chunk),
+                            }
+                        ],
+                    },
+                ]
+            ]
+
+            max_retries = 3
+            for attempt in range(max_retries):
+                outputs = large_llm.chat(conversation, sampling_params, use_tqdm=True)
+                generated_text = outputs[0].outputs[0].text.strip()
+
+                try:
+                    paper_points.append(
+                        [
+                            DataPointBase.model_validate(item).model_dump()
+                            for item in json.loads(generated_text)
+                        ]
+                    )
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        print(
+                            f"Warning: Skipping data points extraction for paper_id {paper['paper_id']}, chunk {idx} due to {e}"
+                        )
+                        paper_points.append([])
+                    else:
+                        conversation[0].append(
+                            {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": generated_text}],
+                            }
+                        )
+                        conversation[0].append(
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"""
+                                            Error: {e} for paper_id {paper['paper_id']}, chunk {idx} 
+                                            Please fix the error and return a valid JSON array of objects conforming to the schema.
+                                        """,
+                                    },
+                                ],
+                            }
+                        )
+
+        data_points_all.append(paper_points)
+
+    return data_points_all
 
 
 # -----------------------------------------------------------------------------
@@ -685,9 +844,9 @@ def main():
     modified_question = default_question
 
     search_params, papers = (
-        question_to_search_params_and_papers_threaded.local(modified_question)
+        question_to_query_and_papers_threaded.local(modified_question)
         if modal.is_local()
-        else question_to_search_params_and_papers_threaded.remote(modified_question)
+        else question_to_query_and_papers_threaded.remote(modified_question)
     )
     print(search_params)
     print(len(papers))
@@ -700,6 +859,15 @@ def main():
     )
     print(len(reranked_papers))
     print(reranked_papers[0] if reranked_papers else None)
+
+    data_points = (
+        extract_data_points_threaded.local(reranked_papers)
+        if modal.is_local()
+        else extract_data_points_threaded.remote(reranked_papers)
+    )
+    print(len(data_points))
+    print(len(data_points[0]) if data_points else None)
+    print(data_points[0] if data_points and data_points[0] else None)
 
 
 @app.local_entrypoint()

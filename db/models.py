@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from sqlalchemy import JSON, Column
 from sqlmodel import Field, Relationship, SQLModel
@@ -31,10 +31,11 @@ class UserBase(SQLModel):
 
 class User(UserBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: UUID = Field(
-        default_factory=uuid4,
+    uuid: str = Field(
+        default_factory=lambda: str(uuid4()),
     )
 
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     hashed_password: str | None = Field(default=None)
     reset_token: str | None = Field(default=None)
     reset_token_expiry: datetime | None = Field(default=None)
@@ -47,7 +48,7 @@ class UserCreate(UserBase):
 
 
 class UserRead(UserBase):
-    uuid: UUID
+    uuid: str
     trials: list["Trial"] | None = None
 
 
@@ -61,9 +62,10 @@ class TrialBase(SQLModel):
 
 class Trial(TrialBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: UUID = Field(default_factory=uuid4)
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
 
-    session_uuid: UUID | None = Field(default=None)
+    session_uuid: str | None = Field(default=None)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     user_id: int | None = Field(default=None, foreign_key="user.id", ondelete="CASCADE")
     user: User | None = Relationship(back_populates="trials")
@@ -86,7 +88,7 @@ class SearchParamsBase(SQLModel):
 
 class SearchParams(SearchParamsBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: UUID = Field(default_factory=uuid4)
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
 
     trial_id: int | None = Field(
         default=None, foreign_key="trial.id", ondelete="CASCADE"
@@ -120,14 +122,36 @@ class PaperBase(SQLModel):
     citation_styles: dict | None = Field(default=None, sa_column=Column(JSON))
     authors: list[dict] | None = Field(default=None, sa_column=Column(JSON))
 
-    text: str | None = Field(default=None)
+    chunks: list[str] | None = Field(default=None, sa_column=Column(JSON))
 
 
 class Paper(PaperBase, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    uuid: UUID = Field(default_factory=uuid4)
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
 
     trial_id: int | None = Field(
         default=None, foreign_key="trial.id", ondelete="CASCADE"
     )
     trial: Trial | None = Relationship(back_populates="papers")
+
+    data_points: list["DataPoint"] = Relationship(
+        back_populates="paper", cascade_delete=True
+    )
+
+
+# data points
+
+
+class DataPointBase(SQLModel):
+    name: str
+    value: float
+    unit: str | None = None
+    excerpt: str | None = None
+
+
+class DataPoint(DataPointBase, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
+
+    paper_id: int | None = Field(foreign_key="paper.id", ondelete="CASCADE")
+    paper: Paper | None = Relationship(back_populates="data_points")
