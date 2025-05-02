@@ -57,6 +57,9 @@ class UserRead(UserBase):
 
 class TrialBase(SQLModel):
     question: str
+
+    data_point_extract_complete: bool | None = Field(default=None)
+    rerank_and_visualize_complete: bool | None = Field(default=None)
     success: bool | None = Field(default=None)
 
 
@@ -77,6 +80,7 @@ class Trial(TrialBase, table=True):
         back_populates="trial",
         cascade_delete=True,
     )
+    visualization: dict | None = Field(default=None, sa_column=Column(JSON))
 
 
 # search params
@@ -134,9 +138,40 @@ class Paper(PaperBase, table=True):
     )
     trial: Trial | None = Relationship(back_populates="papers")
 
-    data_points: list["DataPoint"] = Relationship(
+    data_points: list["DataPoint"] | None = Relationship(
         back_populates="paper", cascade_delete=True
     )
+
+    def __str__(self):
+        paper = self.dict()
+        return f"""
+            Title: {paper.get("title", "")}
+            Abstract: {paper.get("abstract", "")}
+            Venue: {paper.get("venue", "")}
+            Publication Venue: {paper.get("publication_venue", {})}
+            Year: {paper.get("year", "")}
+            Reference Count: {paper.get("reference_count", "")}
+            Citation Count: {paper.get("citation_count", "")}
+            Influential Citation Count: {paper.get("influential_citation_count", "")}
+            Fields of Study: {paper.get("fields_of_study", "")}
+            Publication Types: {paper.get("publication_types", "")}
+            Publication Date: {paper.get("publication_date", "")}
+            Journal: {paper.get("journal", "")}
+            Authors: {"\n\n".join(
+                [
+                    f"""
+                    Name: {author.get("name", "")}
+                    Affiliations: {', '.join(author.get("affiliations", []))}
+                    Paper Count: {author.get("paper_count", "")}
+                    Citation Count: {author.get("citation_count", "")}
+                    H-Index: {author.get("h_index", "")}
+                    """
+                    for author in paper.get("authors", [])
+                ]
+            )}
+            Text: {"\n\n".join(paper.get("chunks", []))}
+            Extracted data points: {"\n\n".join([str(dp) for dp in paper.get("data_points", [])])}
+        """
 
 
 # data points
@@ -147,6 +182,9 @@ class DataPointBase(SQLModel):
     value: float
     unit: str | None = None
     excerpt: str | None = None
+
+    def __str__(self):
+        return f"{self.name}: {self.value} {self.unit} ({self.excerpt})"
 
 
 class DataPoint(DataPointBase, table=True):

@@ -63,6 +63,18 @@ make migrate MSG="your migration message" ENV=dev
 
 ### Frontend
 
+Test helper functions locally:
+
+```bash
+uv run src/helpers.py
+```
+
+Test helper functions on Modal:
+
+```bash
+modal run src/helpers.py
+```
+
 Serve the web app locally:
 
 ```bash

@@ -4,18 +4,30 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 import modal
+import numpy as np
+import plotly.graph_objects as go
 import requests
+import torch
+import umap
+from huggingface_hub import snapshot_download
 from pydantic import BaseModel
+from rerankers import Reranker
+from tqdm import tqdm
+from tqdm.contrib.concurrent import thread_map
+from unstructured.partition.pdf import partition_pdf
+from vllm import LLM, SamplingParams
+from vllm.sampling_params import GuidedDecodingParams
 
 from db.models import DataPointBase, PaperBase, SearchParamsBase
 from utils import (
     APP_NAME,
-    CPU,
-    MEM,
     MINUTES,
     PYTHON_VERSION,
     SECRETS,
 )
+
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
 
 # -----------------------------------------------------------------------------
 
@@ -37,7 +49,7 @@ else:
     PRETRAINED_VOL_PATH = Path(f"/{PRETRAINED_VOLUME}")
 
 
-small_llm_name = "Qwen/Qwen2.5-3B-Instruct-AWQ"
+small_llm_name = "Qwen/Qwen3-1.7B"
 small_llm_enforce_eager = False
 small_llm_max_num_seqs = 1 if modal.is_local() else 1024
 small_llm_trust_remote_code = True
@@ -45,7 +57,7 @@ small_llm_max_model_len = 32768
 small_llm_enable_chunked_prefill = True
 small_llm_max_num_batched_tokens = small_llm_max_model_len
 
-medium_llm_name = "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
+medium_llm_name = "Qwen/Qwen3-4B"
 medium_llm_enforce_eager = False
 medium_llm_max_num_seqs = 1 if modal.is_local() else 512
 medium_llm_trust_remote_code = True
@@ -53,24 +65,24 @@ medium_llm_max_model_len = 32768
 medium_llm_enable_chunked_prefill = True
 medium_llm_max_num_batched_tokens = medium_llm_max_model_len
 
-reranker_name = "answerdotai/answerai-colbert-small-v1"
-
-large_llm_name = (
-    "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4"
-    if modal.is_local()
-    else "google/gemma-3-27b-it"
-)  # google/gemma-3-27b-it-qat-q4_0-gguf
-
+large_llm_name = medium_llm_name if modal.is_local() else "Qwen/Qwen3-30B-A3B-FP8"
 large_llm_enforce_eager = False
 large_llm_max_num_seqs = 1 if modal.is_local() else 4
 large_llm_trust_remote_code = True
-large_llm_max_model_len = 32768 if modal.is_local() else 131072
+large_llm_max_model_len = 32768
 large_llm_enable_chunked_prefill = True
 large_llm_max_num_batched_tokens = large_llm_max_model_len
 
+reranker_name = "answerdotai/answerai-colbert-small-v1"
+reranker_batch_size = 16
+
 
 def download_models():
-    for llm_name in [small_llm_name, medium_llm_name, reranker_name, large_llm_name]:
+    for llm_name in [
+        small_llm_name,
+        medium_llm_name,
+        large_llm_name,
+    ]:
         snapshot_download(
             repo_id=llm_name,
             local_dir=PRETRAINED_VOL_PATH,
@@ -90,12 +102,14 @@ GPU_IMAGE = (
         "huggingface-hub>=0.30.2",
         "ninja>=1.11.1.4",  # required to build flash-attn
         "packaging>=24.2",  # required to build flash-attn
-        "rerankers[transformers]>=0.9.1.post1",
+        "plotly>=6.0.1",
+        "rerankers>=0.9.1.post1",
         "sqlalchemy>=2.0.40",
         "sqlmodel>=0.0.24",
         "torch>=2.6.0",
         "tqdm>=4.67.1",
         "transformers>=4.51.1",
+        "umap-learn>=0.5.7",
         "unstructured[local-inference,pdf]>=0.17.2",
         "vllm>=0.8.3",
         "wheel>=0.45.1",  # required to build flash-attn
@@ -114,32 +128,20 @@ GPU_IMAGE = (
     )
     .add_local_python_source("_remote_module_non_scriptable", "src", "db", "utils")
 )
-app = modal.App(f"{APP_NAME}-llm")
+app = modal.App(f"{APP_NAME}-helpers")
 
 # -----------------------------------------------------------------------------
-
-with GPU_IMAGE.imports():
-    import torch
-    from huggingface_hub import snapshot_download
-    from rerankers import Reranker
-    from tqdm import tqdm
-    from tqdm.contrib.concurrent import thread_map
-    from unstructured.partition.pdf import partition_pdf
-    from vllm import LLM, SamplingParams
-    from vllm.sampling_params import GuidedDecodingParams
-
-    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
-    gpu="l40s:1",
+    cpu=1,  # cores
+    memory=1024,  # MB
+    gpu="l40s:1",  # 1 L40s GPU
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    timeout=5 * MINUTES,
+    scaledown_window=5 * MINUTES,
 )
 @modal.concurrent(max_inputs=small_llm_max_num_seqs)
 def check_question_threaded(question: str) -> list[str] | None:
@@ -156,6 +158,7 @@ def check_question_threaded(question: str) -> list[str] | None:
         max_model_len=small_llm_max_model_len,
         enable_chunked_prefill=small_llm_enable_chunked_prefill,
         max_num_batched_tokens=small_llm_max_num_batched_tokens,
+        guided_decoding_backend="xgrammar",
     )
 
     system_prompt = """
@@ -200,11 +203,13 @@ def check_question_threaded(question: str) -> list[str] | None:
         Note that each suggestion should be a SINGLE word or phrase, not a full sentence.
     """
 
-    temperature = 0.0
+    temperature = 0.7
     top_p = 0.8
+    top_k = 20
+    min_p = 0
     repetition_penalty = 1.05
     stop_token_ids = []
-    max_tokens = 256
+    max_tokens = 2048
 
     class CheckQuestion(BaseModel):
         suggestions: list[str] | None
@@ -213,6 +218,8 @@ def check_question_threaded(question: str) -> list[str] | None:
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
@@ -231,7 +238,7 @@ def check_question_threaded(question: str) -> list[str] | None:
         ]
     ]
     outputs = small_llm.chat(conversations, sampling_params, use_tqdm=True)
-    generated_text = outputs[0].outputs[0].text.strip()
+    generated_text = outputs[0].outputs[0].text.split("</think>")[-1].strip()
     try:
         response_dict = json.loads(generated_text)
         response = CheckQuestion.model_validate(response_dict)
@@ -248,13 +255,13 @@ def check_question_threaded(question: str) -> list[str] | None:
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
+    cpu=1,
+    memory=1024,
     gpu="l40s:1",
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    timeout=5 * MINUTES,
+    scaledown_window=5 * MINUTES,
 )
 @modal.concurrent(max_inputs=small_llm_max_num_seqs)
 def modify_question_threaded(question: str, suggestion: str) -> str:
@@ -311,12 +318,17 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
 
     temperature = 0.7
     top_p = 0.8
+    top_k = 20
+    min_p = 0
     repetition_penalty = 1.05
     stop_token_ids = []
-    max_tokens = 512
+    max_tokens = 2048
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
@@ -334,28 +346,29 @@ def modify_question_threaded(question: str, suggestion: str) -> str:
         ]
     ]
     outputs = small_llm.chat(conversations, sampling_params, use_tqdm=True)
-    generated_text = outputs[0].outputs[0].text.strip().strip('"')
+    generated_text = outputs[0].outputs[0].text.split("</think>")[-1].strip()
     return generated_text
 
 
-@app.function(
-    image=GPU_IMAGE,
-    cpu=CPU,
-    volumes=VOLUME_CONFIG,
-    secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
-)
-def search_papers_threaded(
+def query_to_papers(
     query: str,
-    max_results: int = 50,
-) -> list[dict]:
+    min_results: int,
+    max_results: int,
+) -> dict[str, list[dict] | str]:
     url = "https://api.semanticscholar.org/graph/v1/paper/search/bulk"
     url += f"?query={query}"
     url += "&fields=paperId,corpusId,externalIds,url,title,abstract,venue,publicationVenue,year,referenceCount,citationCount,influentialCitationCount,isOpenAccess,openAccessPdf,fieldsOfStudy,s2FieldsOfStudy,publicationTypes,publicationDate,journal,citationStyles,authors"
     url += "&openAccessPdf"
 
-    r = requests.get(url).json()
+    r = requests.get(url)
+    try:
+        r.raise_for_status()
+        r = r.json()
+    except Exception as e:
+        error_msg = f"Error: {e}"
+        print(error_msg)
+        return {"error": error_msg}
+
     papers = []
     while True:
         if "data" not in r:
@@ -385,21 +398,32 @@ def search_papers_threaded(
                 authors=paper_data["authors"],
             )
             papers.append(paper.model_dump())
-        if "token" not in r or len(papers) >= max_results:
+        if "token" not in r or r["token"] is None or len(papers) >= max_results:
             break
-        r = requests.get(f"{url}&token={r['token']}").json()
-    return papers[:max_results]
+
+        r = requests.get(f"{url}&token={r['token']}")
+        try:
+            r.raise_for_status()
+            r = r.json()
+        except requests.exceptions.HTTPError as e:
+            error_msg = f"Error: {e}"
+            print(error_msg)
+            return {"error": error_msg}
+
+    if len(papers) < min_results:
+        return {"error": f"Not enough results: {len(papers)} < {min_results}"}
+    return {"success": papers[:max_results]}
 
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
+    cpu=1,
+    memory=1024,
     gpu="l40s:1",
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    timeout=10 * MINUTES,
+    scaledown_window=5 * MINUTES,
 )
 @modal.concurrent(max_inputs=medium_llm_max_num_seqs)
 def question_to_query_and_papers_threaded(
@@ -464,20 +488,26 @@ def question_to_query_and_papers_threaded(
         - etc.
     """
 
-    temperature = 0.0
-    top_p = 0.8
+    temperature = 0.6
+    top_p = 0.95
+    top_k = 20
+    min_p = 0
     repetition_penalty = 1.05
     stop_token_ids = []
-    max_tokens = 512
+    max_tokens = 2048
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
     )
 
     # retries in case no results
+    papers = []
     conversations = [
         [
             {"role": "system", "content": system_prompt},
@@ -492,24 +522,23 @@ def question_to_query_and_papers_threaded(
     num_retries = 3
     for i in range(num_retries):
         outputs = medium_llm.chat(conversations, sampling_params, use_tqdm=True)
-        generated_text = outputs[0].outputs[0].text.strip()
+        generated_text = outputs[0].outputs[0].text.split("</think>")[-1].strip()
 
         search_params = SearchParamsBase.model_validate({"query": generated_text})
         search_params_dict = search_params.model_dump()
-        papers = (
-            search_papers_threaded.local(**search_params_dict)
-            if modal.is_local()
-            else search_papers_threaded.remote(**search_params_dict)
+        result = query_to_papers(
+            **search_params_dict, min_results=min_results, max_results=max_results
         )
-        if len(papers) >= min_results:
+
+        if "success" in result and len(result["success"]) >= min_results:
+            papers = result["success"]
             break
         else:
             if i == num_retries - 1:
                 print(
-                    f"Warning: Skipping search for question {question} due to too few results"
+                    f"Warning: Skipping search for question {question} due to {result['error']}"
                 )
-                search_params_dict = {}
-                papers = []
+                return {}, []
             else:
                 conversations[0].append(
                     {
@@ -523,27 +552,24 @@ def question_to_query_and_papers_threaded(
                         "content": [
                             {
                                 "type": "text",
-                                "text": (
-                                    f"Error: Need {min_results} papers, only {len(papers)} found using these parameters: {generated_text}. "
-                                    "Please reformulate the search parameters for broader coverage and return only the JSON with new parameters."
-                                ),
+                                "text": (f"Error: {result['error']}"),
                             },
                         ],
                     }
                 )
 
-    return search_params_dict, papers[:max_results]
+    return search_params_dict, papers
 
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
+    cpu=1,
+    memory=1024,
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
-)
+    timeout=10 * MINUTES,
+    scaledown_window=10 * MINUTES,
+)  # called by screen_papers_threaded
 def paper_to_chunks(paper: dict) -> list[str] | None:
     try:
         open_access_pdf = paper.get("open_access_pdf", {})
@@ -573,9 +599,8 @@ def paper_to_chunks(paper: dict) -> list[str] | None:
                 tmp_file.name,
                 url=None,
                 chunking_strategy="by_title",
-                max_characters=large_llm_max_model_len
-                // 2,  # hard limit with retries in mind (roughly 4x chars -> 1 token)
-                new_after_n_chars=large_llm_max_model_len // 4,  # soft limit
+                max_characters=large_llm_max_model_len,  # hard limit, keeping in mind 1) 3 retries in mind and 2) ~4x chars/token
+                new_after_n_chars=large_llm_max_model_len // 1.5,  # soft limit
             )
 
         chunks = [element.text for element in chunk_elements]
@@ -589,28 +614,16 @@ def paper_to_chunks(paper: dict) -> list[str] | None:
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
-    gpu="l40s:1",
+    cpu=0.125,
+    memory=128,
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=2 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    timeout=10 * MINUTES,
+    scaledown_window=10 * MINUTES,
 )
-def rerank_papers_threaded(
-    question: str, papers: list[dict], max_results: int = 50
+def screen_papers_threaded(
+    papers: list[dict],
 ) -> list[dict]:
-    paper_idxs = range(len(papers))
-    ranker = Reranker(
-        reranker_name,
-        model_type="colbert",
-        verbose=0,
-        dtype=torch.bfloat16,
-        device="cuda",
-        batch_size=16,
-        model_kwargs={"cache_dir": PRETRAINED_VOL_PATH},
-    )
-
     if modal.is_local():
         chunk_lists = list(
             tqdm(thread_map(paper_to_chunks.local, papers), desc="Processing papers")
@@ -618,67 +631,26 @@ def rerank_papers_threaded(
     else:
         chunk_lists = list(paper_to_chunks.map(papers))
 
-    filtered = [
-        (chunks, idx)
-        for chunks, idx in zip(chunk_lists, paper_idxs)
-        if chunks is not None
-    ]
-    if not filtered:
-        return []
-    chunk_lists, paper_idxs = zip(*filtered)
-    docs = [
-        f"""
-            Title: {paper.get("title", "")}
-            Abstract: {paper.get("abstract", "")}
-            Venue: {paper.get("venue", "")}
-            Publication Venue: {paper.get("publication_venue", {})}
-            Year: {paper.get("year", "")}
-            Reference Count: {paper.get("reference_count", "")}
-            Citation Count: {paper.get("citation_count", "")}
-            Influential Citation Count: {paper.get("influential_citation_count", "")}
-            Text: {"\n\n".join(chunks)}
-            Fields of Study: {paper.get("fields_of_study", "")}
-            Publication Types: {paper.get("publication_types", "")}
-            Publication Date: {paper.get("publication_date", "")}
-            Journal: {paper.get("journal", "")}
-            Authors: {"\n\n".join(
-                [
-                    f"""
-                    Name: {author.get("name", "")}
-                    Affiliations: {', '.join(author.get("affiliations", []))}
-                    Paper Count: {author.get("paper_count", "")}
-                    Citation Count: {author.get("citation_count", "")}
-                    H-Index: {author.get("h_index", "")}
-                    """
-                    for author in paper.get("authors", [])
-                ]
-            )}
-        """
-        for paper, chunks in zip(papers, chunk_lists)
-    ]
-
-    results = ranker.rank(query=question, docs=docs)
-    top_k_idxs = [doc.doc_id for doc in results.top_k(max_results)]
     screened_papers = []
-    for i in top_k_idxs:
-        paper = papers[paper_idxs[i]]
-        paper["chunks"] = chunk_lists[i]
-        screened_papers.append(paper)
+    for paper, chunks in zip(papers, chunk_lists):
+        if chunks is not None and paper["abstract"]:
+            paper["chunks"] = chunks
+            screened_papers.append(paper)
     return screened_papers
 
 
 @app.function(
     image=GPU_IMAGE,
-    cpu=CPU,
-    memory=MEM,
+    cpu=1,
+    memory=1024,
     gpu="h100:1",
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
-    timeout=4 * MINUTES,
-    scaledown_window=15 * MINUTES,
+    timeout=15 * MINUTES,
+    scaledown_window=5 * MINUTES,
 )
 @modal.concurrent(max_inputs=large_llm_max_num_seqs)
-def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
+def extract_data_points_threaded(question: str, papers: list[dict]) -> list[list[dict]]:
     large_llm = LLM(
         download_dir=PRETRAINED_VOL_PATH,
         model=large_llm_name,
@@ -690,16 +662,21 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
         max_model_len=large_llm_max_model_len,
         enable_chunked_prefill=large_llm_enable_chunked_prefill,
         max_num_batched_tokens=large_llm_max_num_batched_tokens,
+        guided_decoding_backend="xgrammar",
     )
 
     system_prompt = """
-        You are a specialized research methodology expert that extracts key data points from academic papers.
+        You are a specialized research methodology expert that extracts key data points from academic papers with a research question in mind.
         Your ONLY task is to extract key data points from academic papers and return a structured JSON response in the EXACT format required. 
         Do not deviate from the response format under any circumstances.
         Your output should ONLY be the data points with no additional explanations.
     """
     user_prompt = """
-        Task: Given this chunk of text from an academic paper below, extract all relevant data points and format them as per the schema described.
+        Task: Given this research question:
+
+        {question}
+
+        and the following chunk of text from an academic paper below, extract all relevant data points and format them as per the schema described.
 
         Paper content:
         {paper}
@@ -731,17 +708,22 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
         If there are no data points, return an empty array.
     """
 
-    temperature = 0.0
-    top_p = 0.8
+    temperature = 0.6
+    top_p = 0.95
+    top_k = 20
+    min_p = 0
     repetition_penalty = 1.05
     stop_token_ids = []
     max_tokens = 8192
     guided_decoding = GuidedDecodingParams(
         json={"type": "array", "items": DataPointBase.model_json_schema()}
     )
+
     sampling_params = SamplingParams(
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
         repetition_penalty=repetition_penalty,
         stop_token_ids=stop_token_ids,
         max_tokens=max_tokens,
@@ -760,7 +742,9 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
                         "content": [
                             {
                                 "type": "text",
-                                "text": user_prompt.format(paper=chunk),
+                                "text": user_prompt.format(
+                                    question=question, paper=chunk
+                                ),
                             }
                         ],
                     },
@@ -770,10 +754,12 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
             max_retries = 3
             for attempt in range(max_retries):
                 outputs = large_llm.chat(conversation, sampling_params, use_tqdm=True)
-                generated_text = outputs[0].outputs[0].text.strip()
+                generated_text = (
+                    outputs[0].outputs[0].text.split("</think>")[-1].strip()
+                )
 
                 try:
-                    paper_points.append(
+                    paper_points.extend(
                         [
                             DataPointBase.model_validate(item).model_dump()
                             for item in json.loads(generated_text)
@@ -785,7 +771,6 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
                         print(
                             f"Warning: Skipping data points extraction for paper_id {paper['paper_id']}, chunk {idx} due to {e}"
                         )
-                        paper_points.append([])
                     else:
                         conversation[0].append(
                             {
@@ -813,11 +798,106 @@ def extract_data_points_threaded(papers: list[dict]) -> list[list[dict]]:
     return data_points_all
 
 
+@app.function(
+    image=GPU_IMAGE,
+    cpu=1,
+    memory=1024,
+    gpu="l40s:1",
+    volumes=VOLUME_CONFIG,
+    secrets=SECRETS,
+    timeout=10 * MINUTES,
+    scaledown_window=5 * MINUTES,
+)
+def rerank_and_visualize_papers_threaded(
+    question: str, papers: list[dict]
+) -> tuple[list[dict], dict]:  # papers, visualization as plotly figure json
+    ranker = Reranker(
+        reranker_name,
+        model_type="colbert",
+        verbose=0,
+        dtype=torch.bfloat16,
+        device="cuda",
+        batch_size=reranker_batch_size,
+        model_kwargs={"cache_dir": PRETRAINED_VOL_PATH},
+    )
+
+    str_papers = [str(PaperBase(**paper)) for paper in papers]
+
+    results = ranker.rank(query=question, docs=str_papers)
+    top_k_idxs = [doc.doc_id for doc in results.top_k(len(papers))]
+    reranked_papers = [papers[i] for i in top_k_idxs]
+
+    # umap of embeddings into 3D
+    paper_embeddings = (
+        ranker._to_embs(ranker._document_encode(str_papers))
+        .to(torch.float32)
+        .cpu()
+        .numpy()
+    )  # (N_docs, seq_len, hidden_dim)
+    paper_embeddings = np.concatenate(
+        [paper_embeddings.mean(axis=1), paper_embeddings.max(axis=1)], axis=1
+    )  # concatenate mean and max token embeddings -> (N_docs, 2*hidden_dim)
+
+    umap_inst = umap.UMAP(
+        n_neighbors=min(15, len(papers) - 1), n_components=3, metric="cosine"
+    )
+    data_transform = umap_inst.fit_transform(paper_embeddings)
+
+    paper_scatter = go.Scatter3d(
+        x=data_transform[:, 0],
+        y=data_transform[:, 1],
+        z=data_transform[:, 2],
+        mode="markers",
+        marker=dict(color="cyan", size=4),
+        text=[
+            f"Rank: {i}\n{str(PaperBase(**paper))}" for i, paper in enumerate(papers)
+        ],
+        hoverinfo="text",
+    )
+
+    connectivity = umap_inst.graph_
+    edges_x, edges_y, edges_z = [], [], []
+    connectivity_coo = connectivity.tocoo()
+
+    for i, j, v in zip(
+        connectivity_coo.row, connectivity_coo.col, connectivity_coo.data
+    ):
+        # Only draw edges for strong connections (adjust threshold as needed)
+        if v > 0.1 and i < j:  # Avoid duplicate edges (i<j) and self-connections
+            edges_x.extend([data_transform[i, 0], data_transform[j, 0], None])
+            edges_y.extend([data_transform[i, 1], data_transform[j, 1], None])
+            edges_z.extend([data_transform[i, 2], data_transform[j, 2], None])
+
+    edges_trace = go.Scatter3d(
+        x=edges_x,
+        y=edges_y,
+        z=edges_z,
+        mode="lines",
+        line=dict(color="rgba(100, 100, 100, 0.2)", width=1),
+        hoverinfo="none",
+    )
+
+    fig = go.Figure(data=[edges_trace, paper_scatter])
+    fig.update_layout(
+        hovermode="closest",
+        scene=dict(
+            xaxis=dict(showticklabels=False, title=""),
+            yaxis=dict(showticklabels=False, title=""),
+            zaxis=dict(showticklabels=False, title=""),
+        ),
+        margin=dict(l=0, r=0, b=0, t=0),
+    )
+
+    return reranked_papers, fig.to_json()
+
+
 # -----------------------------------------------------------------------------
 
 
 @app.function(
     image=GPU_IMAGE,
+    cpu=0.125,
+    memory=128,
     volumes=VOLUME_CONFIG,
     secrets=SECRETS,
     timeout=60 * MINUTES,
@@ -827,19 +907,19 @@ def main():
         "What is the relationship between climate change and global health?"
     )
 
-    suggestions = (
-        check_question_threaded.local(default_question)
-        if modal.is_local()
-        else check_question_threaded.remote(default_question)
-    )
-    print(suggestions)
+    # suggestions = (
+    #     check_question_threaded.local(default_question)
+    #     if modal.is_local()
+    #     else check_question_threaded.remote(default_question)
+    # )
+    # print(suggestions)
 
-    modified_question = (
-        modify_question_threaded.local(default_question, suggestions[0])
-        if modal.is_local()
-        else modify_question_threaded.remote(default_question, suggestions[0])
-    )
-    print(modified_question)
+    # modified_question = (
+    #     modify_question_threaded.local(default_question, suggestions[0])
+    #     if modal.is_local()
+    #     else modify_question_threaded.remote(default_question, suggestions[0])
+    # )
+    # print(modified_question)
 
     modified_question = default_question
 
@@ -852,22 +932,47 @@ def main():
     print(len(papers))
     print(papers[0] if papers else None)
 
-    reranked_papers = (
-        rerank_papers_threaded.local(modified_question, papers)
+    screened_papers = (
+        screen_papers_threaded.local(papers)
         if modal.is_local()
-        else rerank_papers_threaded.remote(modified_question, papers)
+        else screen_papers_threaded.remote(papers)
+    )
+    print(len(screened_papers))
+    print(screened_papers[0] if screened_papers else None)
+
+    # data_points = (
+    #     extract_data_points_threaded.local(modified_question, screened_papers)
+    #     if modal.is_local()
+    #     else extract_data_points_threaded.remote(modified_question, screened_papers)
+    # )
+    # print(len(data_points))
+    # print(len(data_points[0]) if data_points else None)
+    # # Print first non-null data point from all papers
+    # found_point = False
+    # for paper_points in data_points:
+    #     for dp in paper_points:
+    #         if dp and dp.get("name") and dp.get("value") is not None:
+    #             print(
+    #                 f"First data point: name={dp.get('name')}, value={dp.get('value')}, "
+    #                 f"unit={dp.get('unit')}, excerpt={dp.get('excerpt')}"
+    #             )
+    #             found_point = True
+    #             break
+    #     if found_point:
+    #         break
+    # if not found_point:
+    #     print("No non-null data points found in any paper")
+
+    reranked_papers, visualization = (
+        rerank_and_visualize_papers_threaded.local(modified_question, screened_papers)
+        if modal.is_local()
+        else rerank_and_visualize_papers_threaded.remote(
+            modified_question, screened_papers
+        )
     )
     print(len(reranked_papers))
     print(reranked_papers[0] if reranked_papers else None)
-
-    data_points = (
-        extract_data_points_threaded.local(reranked_papers)
-        if modal.is_local()
-        else extract_data_points_threaded.remote(reranked_papers)
-    )
-    print(len(data_points))
-    print(len(data_points[0]) if data_points else None)
-    print(data_points[0] if data_points and data_points[0] else None)
+    print(visualization)
 
 
 @app.local_entrypoint()
@@ -876,4 +981,5 @@ def main_modal():
 
 
 if __name__ == "__main__":
+    download_models()
     main.local()

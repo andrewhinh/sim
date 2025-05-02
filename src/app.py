@@ -15,6 +15,16 @@ from pathlib import Path
 from uuid import uuid4
 
 import modal
+import stripe
+from fasthtml import common as fh
+from fasthtml.oauth import GitHubAppClient, GoogleAppClient, redir_url
+from passlib.hash import pbkdf2_sha256
+from PIL import Image
+from simpleicons.icons import si_github
+from sqlmodel import Session as DBSession
+from sqlmodel import create_engine, select
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import StreamingResponse
 
 from db.models import (
     DataPoint,
@@ -25,19 +35,18 @@ from db.models import (
     User,
     init_balance,
 )
-from src.llm import app as llm_app
-from src.llm import (
+from src.helpers import app as helpers_app
+from src.helpers import (
     check_question_threaded,
     download_models,
     extract_data_points_threaded,
     modify_question_threaded,
     question_to_query_and_papers_threaded,
-    rerank_papers_threaded,
+    rerank_and_visualize_papers_threaded,
+    screen_papers_threaded,
 )
 from utils import (
     APP_NAME,
-    CPU,
-    MEM,
     MINUTES,
     PARENT_PATH,
     PYTHON_VERSION,
@@ -71,21 +80,9 @@ FE_IMAGE = (
 )
 
 app = modal.App(APP_NAME)
-app.include(llm_app)
+app.include(helpers_app)
 
 # -----------------------------------------------------------------------------
-
-with FE_IMAGE.imports():
-    import stripe
-    from fasthtml import common as fh
-    from fasthtml.oauth import GitHubAppClient, GoogleAppClient, redir_url
-    from passlib.hash import pbkdf2_sha256
-    from PIL import Image
-    from simpleicons.icons import si_github
-    from sqlmodel import Session as DBSession
-    from sqlmodel import create_engine, select
-    from starlette.middleware.cors import CORSMiddleware
-    from starlette.responses import StreamingResponse
 
 
 def get_app():  # noqa: C901
@@ -128,8 +125,8 @@ def get_app():  # noqa: C901
     input_bg_color = "stone-50"
     input_cls = f"bg-{input_bg_color} {rounded} {shadow} hover:{shadow_hover} text-{text_color} border border-{border_color} hover:border-{border_hover_color}"
 
-    background_color = "stone-200"
-    main_page = f"flex flex-col justify-between min-h-screen w-full bg-{background_color} text-{text_color} {font}"
+    bg_color = "stone-200"
+    main_page = f"flex flex-col justify-between min-h-screen w-full bg-{bg_color} text-{text_color} {font}"
     page_ctnt = "flex flex-col grow gap-4 p-8"
 
     tailwind_to_hex = {
@@ -289,14 +286,11 @@ def get_app():  # noqa: C901
         "Searching for papers",
         "Screening papers",
         "Extracting data",
-        "Generating participants",
-        "Simulating study",
-        "Clustering participants",
-        "Generating visualization",
+        "Creating visualization",
     ]
 
     # ui components
-    def spinner(id="", cls=""):
+    def spinner(id="", cls="", **kwargs):
         return (
             fh.Svg(
                 fh.NotStr(
@@ -307,6 +301,59 @@ def get_app():  # noqa: C901
                 ),
                 id=id,
                 cls=f"animate-spin {cls}",
+                **kwargs,
+            ),
+        )
+
+    def checkmark(id="", cls="", **kwargs):
+        return (
+            fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" fill="currentColor"/>
+                    </svg>"""
+                ),
+                id=id,
+                cls=cls,
+                **kwargs,
+            ),
+        )
+
+    def cross(id="", cls="", **kwargs):
+        return (
+            fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                        <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" fill="currentColor"/>
+                    </svg>"""
+                ),
+                id=id,
+                cls=cls,
+                **kwargs,
+            ),
+        )
+
+    def trash(id="", cls="", **kwargs):
+        return (
+            fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z" /></svg>"""
+                ),
+                id=id,
+                cls=cls,
+                **kwargs,
+            ),
+        )
+
+    def google(id="", cls="", **kwargs):
+        return (
+            fh.Svg(
+                fh.NotStr(
+                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.0003 4.75C13.7703 4.75 15.3553 5.36002 16.6053 6.54998L20.0303 3.125C17.9502 1.19 15.2353 0 12.0003 0C7.31028 0 3.25527 2.69 1.28027 6.60998L5.27028 9.70498C6.21525 6.86002 8.87028 4.75 12.0003 4.75Z" fill="#EA4335"/><path d="M23.49 12.275C23.49 11.49 23.415 10.73 23.3 10H12V14.51H18.47C18.18 15.99 17.34 17.25 16.08 18.1L19.945 21.1C22.2 19.01 23.49 15.92 23.49 12.275Z" fill="#4285F4"/><path d="M5.26498 14.2949C5.02498 13.5699 4.88501 12.7999 4.88501 11.9999C4.88501 11.1999 5.01998 10.4299 5.26498 9.7049L1.275 6.60986C0.46 8.22986 0 10.0599 0 11.9999C0 13.9399 0.46 15.7699 1.28 17.3899L5.26498 14.2949Z" fill="#FBBC05"/><path d="M12.0004 24.0001C15.2404 24.0001 17.9654 22.935 19.9454 21.095L16.0804 18.095C15.0054 18.82 13.6204 19.245 12.0004 19.245C8.8704 19.245 6.21537 17.135 5.2654 14.29L1.27539 17.385C3.25539 21.31 7.3104 24.0001 12.0004 24.0001Z" fill="#34A853"/></svg>""",
+                ),
+                id=id,
+                cls=cls,
+                **kwargs,
             ),
         )
 
@@ -320,33 +367,34 @@ def get_app():  # noqa: C901
                 fh.Td(
                     fh.Div(
                         fh.Input(
+                            id=f"trials-{trial.uuid}-checkbox",
                             type="checkbox",
                             name="selected_trials",
                             value=trial.uuid,
-                            hx_target="#trial-manage",
+                            hx_post="/trials/show-select-delete",
+                            hx_target="#trials-manage",
                             hx_swap="outerHTML",
                             hx_trigger="change",
-                            hx_post="/trials/show-select-delete",
-                            hx_indicator="#spinner",
+                            hx_indicator=f"#trials-{trial.uuid}-ldr",
+                            hx_disabled_elt=f"#trials-{trial.uuid}-trash",
                             cls="hide-when-loading",
                         ),
                         spinner(
-                            id=f"trial-{trial.uuid}-show-select-delete-loader",
+                            id=f"trials-{trial.uuid}-checkbox-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
-                        fh.Svg(
-                            fh.NotStr(
-                                """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z" /></svg>"""
-                            ),
+                        trash(
+                            id=f"trials-{trial.uuid}-trash",
                             hx_delete=f"/trials/{trial.uuid}",
-                            hx_indicator="#spinner",
                             hx_target="closest tr",
                             hx_swap="outerHTML swap:.25s",
+                            hx_indicator=f"#trials-{trial.uuid}-trash-ldr",
+                            hx_disabled_elt=f"#trials-{trial.uuid}-checkbox",
                             hx_confirm="Are you sure?",
-                            cls=f"hide-when-loading size-8 text-{click_danger_color} hover:text-{click_danger_hover_color}",
+                            cls=f"hide-when-loading size-8 cursor-pointer text-{click_danger_color} hover:text-{click_danger_hover_color}",
                         ),
                         spinner(
-                            id=f"trial-{trial.uuid}-delete-loader",
+                            id=f"trials-{trial.uuid}-trash-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         cls="w-1/6 flex justify-start items-center gap-2",
@@ -359,17 +407,15 @@ def get_app():  # noqa: C901
                             href=f"/trials/{trial.uuid}",
                             cls=f"text-{text_color} hover:text-{text_hover_color}",
                         ),
-                        spinner(
-                            id=f"trial-{trial.uuid}-main-loader",
+                        fh.Div(
+                            id=f"trials-{trial.uuid}-status",
                             hx_ext="sse",
                             sse_connect=f"/trials/{trial.uuid}/stream",
-                            sse_swap="UpdateTrial",
-                            cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            sse_swap="UpdateTrials",
                         ),
                         cls="w-5/6",
                     ),
-                    id=f"trial-{trial.uuid}",
-                    cls="w-full flex justify-between items-center p-4",
+                    cls=f"w-full flex justify-between items-center p-4 {input_cls}",
                 ),
                 cls="flex grow",
             ),
@@ -381,7 +427,7 @@ def get_app():  # noqa: C901
                 f"({len(get_curr_trials(session))} total trials)",
                 cls=f"text-{text_color}",
             ),
-            id="trial-count",
+            id="trials-count",
             hx_swap_oob=hx_swap_oob if hx_swap_oob != "false" else None,
             cls="flex justify-center items-center",
         )
@@ -394,42 +440,42 @@ def get_app():  # noqa: C901
             fh.Button(
                 fh.P(
                     "Delete selected",
-                    id="delete-select-trials-button-text",
+                    id="trials-del-sel-btn-txt",
                     cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 spinner(
-                    id="delete-select-trials-loader",
+                    id="trials-del-sel-ldr",
                     cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_delete="/trials/select",
-                hx_target="#trial-list",
+                hx_target="#trials-list",
                 hx_confirm="Are you sure?",
-                hx_indicator="#delete-select-trials-button-text, #delete-select-trials-loader",
-                hx_disabled_elt="#delete-select-trials-button-text, #delete-select-trials-loader",
-                cls=f"w-full flex justify-center items-center {click_danger_button} {rounded} p-3",
+                hx_indicator="#trials-del-sel-btn-txt, #trials-del-sel-ldr",
+                hx_disabled_elt="#trials-del-sel-btn-txt, #trials-del-sel-ldr",
+                cls=f"w-full md:w-1/3 flex justify-center items-center {click_danger_button} {rounded} p-3",
             )
             if trials_present and trials_selected
             else None,
             fh.Button(
                 fh.P(
                     "Delete all",
-                    id="delete-all-trials-button-text",
+                    id="trials-del-all-btn-txt",
                     cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 spinner(
-                    id="delete-all-trials-loader",
+                    id="trials-del-all-ldr",
                     cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_delete="/trials",
-                hx_target="#trial-list",
+                hx_target="#trials-list",
                 hx_confirm="Are you sure?",
-                hx_indicator="#delete-all-trials-button-text, #delete-all-trials-loader",
-                hx_disabled_elt="#delete-all-trials-button-text, #delete-all-trials-loader",
-                cls=f"w-full flex justify-center items-center {click_danger_button} {rounded} p-3",
+                hx_indicator="#trials-del-all-btn-txt, #trials-del-all-ldr",
+                hx_disabled_elt="#trials-del-all-btn-txt, #trials-del-all-ldr",
+                cls=f"w-full md:w-1/3 flex justify-center items-center {click_danger_button} {rounded} p-3",
             )
             if trials_present
             else None,
-            id="trial-manage",
+            id="trials-manage",
             hx_swap_oob=hx_swap_oob if hx_swap_oob != "false" else None,
             cls="flex flex-col md:flex-row justify-center items-center gap-4 w-full",
         )
@@ -456,23 +502,23 @@ def get_app():  # noqa: C901
             fh.Button(
                 fh.P(
                     "Load More",
-                    id="load-more-trials-button-text",
+                    id="trials-ld-btn-txt",
                     cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 spinner(
-                    id="load-more-trials-loader",
+                    id="trials-ld-ldr",
                     cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                 ),
                 hx_get=f"/trials/page/{idx}",
-                hx_indicator="#load-more-trials-button-text, #load-more-trials-loader",
-                hx_target="#trial-list",
+                hx_indicator="#trials-ld-btn-txt, #trials-ld-ldr",
+                hx_target="#trials-list",
                 hx_swap="beforeend",
-                hx_disabled_elt="#load-more-trials-button-text, #load-more-trials-loader",
+                hx_disabled_elt="#trials-ld-btn-txt, #trials-ld-ldr",
                 cls=f"w-full flex justify-center items-center {click_button} {rounded} p-3",
             )
             if trials_present and still_more
             else None,
-            id="load-more-trials",
+            id="trials-ld",
             hx_swap_oob=hx_swap_oob if hx_swap_oob != "false" else None,
             cls="w-full md:w-2/3",
         )
@@ -496,20 +542,10 @@ def get_app():  # noqa: C901
             "running": spinner(
                 cls=f"size-6 text-{text_color} hover:text-{text_button_hover_color}",
             ),
-            "completed": fh.Svg(
-                fh.NotStr(
-                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                        <path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z" fill="currentColor"/>
-                    </svg>"""
-                ),
+            "completed": checkmark(
                 cls=f"size-6 text-{click_color}",
             ),
-            "failed": fh.Svg(
-                fh.NotStr(
-                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-                        <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" fill="currentColor"/>
-                    </svg>"""
-                ),
+            "failed": cross(
                 cls=f"size-6 text-{error_color}",
             ),
         }
@@ -523,28 +559,35 @@ def get_app():  # noqa: C901
             cls="w-full md:w-2/3 flex justify-start items-center gap-12 md:gap-16",
         )
 
-    def trial_expanded(trial: Trial):
-        return (
-            fh.Div(
-                id=f"trial-visualization-{trial.uuid}",
-            )
-            if trial.success is True
-            else fh.Div(
-                *[
-                    section_view(
-                        section,
-                        "pending",
-                        f"section-{trial.uuid}-{i}",
-                    )
-                    for i, section in enumerate(sections)
-                ],
-                id=f"trial-visualization-{trial.uuid}",
-                hx_ext="ws",
-                ws_connect=f"/trial/ws/{trial.uuid}",
-                hx_trigger="load",
-                cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-start items-end pt-8 gap-8 md:gap-12",
-            ),
+    def trial_visualization(trial: Trial):
+        return fh.Div(
+            id=f"trial-vis-{trial.uuid}",
+        ), fh.Script(
+            f"var data = {trial.visualization}; Plotly.newPlot('trial-vis-{trial.uuid}', data);",
         )
+
+    def trial_expanded(trial: Trial):
+        with get_db_session() as db_session:
+            db_session.add(trial)
+            return (
+                trial_visualization(trial)
+                if trial.success is True
+                else fh.Div(
+                    *[
+                        section_view(
+                            section,
+                            "pending",
+                            f"section-{trial.uuid}-{i}",
+                        )
+                        for i, section in enumerate(sections)
+                    ],
+                    id=f"trial-vis-{trial.uuid}",
+                    hx_ext="ws",
+                    ws_connect=f"/trial/ws/{trial.uuid}",
+                    hx_trigger="load",
+                    cls="w-full md:w-2/3 h-2/3 flex flex-col grow justify-start items-end pt-8 gap-8 md:gap-12",
+                ),
+            )
 
     # ui layout
     def nav(session, show_auth=True):
@@ -610,11 +653,11 @@ def get_app():  # noqa: C901
                     hx_target="#check-results",
                     hx_swap="outerHTML",
                     hx_trigger="change, keyup delay:200ms changed",
-                    hx_indicator="#check-results, #check-loader",
-                    hx_disabled_elt="#question-form-button",
+                    hx_indicator="#check-results, #check-ldr",
+                    hx_disabled_elt="#question-form-btn",
                     cls=f"{input_cls} p-4 resize-none",
                 ),
-                fh.Div(id="new-textarea-content", cls="hidden"),
+                fh.Div(id="new-textarea-ctnt", cls="hidden"),
                 fh.Div(
                     fh.Div(
                         id="check-results",
@@ -629,7 +672,7 @@ def get_app():  # noqa: C901
                             "Evaluating question strength...",
                             cls=f"indicator text-{text_color} hover:text-{text_hover_color}",
                         ),
-                        id="check-loader",
+                        id="check-ldr",
                         cls="indicator flex justify-center items-center space-x-2",
                     ),
                     fh.Div(
@@ -640,7 +683,7 @@ def get_app():  # noqa: C901
                             "Modifying question...",
                             cls=f"indicator text-{text_color} hover:text-{text_hover_color}",
                         ),
-                        id="modify-loader",
+                        id="modify-ldr",
                         cls="indicator flex justify-center items-center space-x-2",
                     ),
                     cls="absolute bottom-2 left-2 p-2",
@@ -648,14 +691,14 @@ def get_app():  # noqa: C901
                 fh.Button(
                     fh.P(
                         "→",
-                        id="question-form-button-text",
+                        id="question-form-btn-txt",
                         cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     spinner(
-                        id="question-form-loader",
+                        id="question-form-ldr",
                         cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
-                    id="question-form-button",
+                    id="question-form-btn",
                     type="submit",
                     cls=f"absolute bottom-0 right-4 rounded-full p-2 {click_button}",
                     style="width: 3rem; height: 3rem;",
@@ -664,9 +707,9 @@ def get_app():  # noqa: C901
                 hx_post="/trial",
                 hx_target="this",
                 hx_swap="none",
-                hx_trigger="keyup[shiftKey&&key=='Enter'] from:body, click from:#question-form-button",
-                hx_indicator="#question-form-button-text, #question-form-loader",
-                hx_disabled_elt="#question, #question-form-button",
+                hx_trigger="keyup[shiftKey&&key=='Enter'] from:body, click from:#question-form-btn",
+                hx_indicator="#question-form-btn-txt, #question-form-ldr",
+                hx_disabled_elt="#question, #question-form-btn",
                 cls="w-full md:w-2/3 relative flex justify-between items-center",
             ),
             fh.Div(
@@ -682,7 +725,7 @@ def get_app():  # noqa: C901
                         question,
                         cls=f"{click_button} px-4 py-2 {rounded}",
                         hx_post="/trial/fill-question",
-                        hx_target="#new-textarea-content",
+                        hx_target="#new-textarea-ctnt",
                         hx_vals=json.dumps(
                             {
                                 "question": question,
@@ -736,10 +779,7 @@ def get_app():  # noqa: C901
                 fh.A(
                     fh.Button(
                         fh.Div(
-                            fh.Svg(
-                                fh.NotStr(
-                                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.0003 4.75C13.7703 4.75 15.3553 5.36002 16.6053 6.54998L20.0303 3.125C17.9502 1.19 15.2353 0 12.0003 0C7.31028 0 3.25527 2.69 1.28027 6.60998L5.27028 9.70498C6.21525 6.86002 8.87028 4.75 12.0003 4.75Z" fill="#EA4335"/><path d="M23.49 12.275C23.49 11.49 23.415 10.73 23.3 10H12V14.51H18.47C18.18 15.99 17.34 17.25 16.08 18.1L19.945 21.1C22.2 19.01 23.49 15.92 23.49 12.275Z" fill="#4285F4"/><path d="M5.26498 14.2949C5.02498 13.5699 4.88501 12.7999 4.88501 11.9999C4.88501 11.1999 5.01998 10.4299 5.26498 9.7049L1.275 6.60986C0.46 8.22986 0 10.0599 0 11.9999C0 13.9399 0.46 15.7699 1.28 17.3899L5.26498 14.2949Z" fill="#FBBC05"/><path d="M12.0004 24.0001C15.2404 24.0001 17.9654 22.935 19.9454 21.095L16.0804 18.095C15.0054 18.82 13.6204 19.245 12.0004 19.245C8.8704 19.245 6.21537 17.135 5.2654 14.29L1.27539 17.385C3.25539 21.31 7.3104 24.0001 12.0004 24.0001Z" fill="#34A853"/></svg>"""
-                                ),
+                            google(
                                 cls="size-6",
                             ),
                             fh.Div(
@@ -779,22 +819,22 @@ def get_app():  # noqa: C901
                     fh.Button(
                         fh.P(
                             "Sign Up",
-                            id="signup-button-text",
+                            id="signup-btn-txt",
                             cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         spinner(
-                            id="signup-loader",
+                            id="signup-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
-                        id="signup-button",
+                        id="signup-btn",
                         type="submit",
                         cls=f"w-full {click_button} p-3 {rounded}",
                     ),
                     hx_post="/auth/signup",
                     hx_target="this",
                     hx_swap="none",
-                    hx_indicator="#signup-button-text, #signup-loader",
-                    hx_disabled_elt="#email, #password, #signup-button",
+                    hx_indicator="#signup-btn-txt, #signup-ldr",
+                    hx_disabled_elt="#email, #password, #signup-btn",
                     cls="w-full",
                 ),
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
@@ -842,10 +882,7 @@ def get_app():  # noqa: C901
                 fh.A(
                     fh.Button(
                         fh.Div(
-                            fh.Svg(
-                                fh.NotStr(
-                                    """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.0003 4.75C13.7703 4.75 15.3553 5.36002 16.6053 6.54998L20.0303 3.125C17.9502 1.19 15.2353 0 12.0003 0C7.31028 0 3.25527 2.69 1.28027 6.60998L5.27028 9.70498C6.21525 6.86002 8.87028 4.75 12.0003 4.75Z" fill="#EA4335"/><path d="M23.49 12.275C23.49 11.49 23.415 10.73 23.3 10H12V14.51H18.47C18.18 15.99 17.34 17.25 16.08 18.1L19.945 21.1C22.2 19.01 23.49 15.92 23.49 12.275Z" fill="#4285F4"/><path d="M5.26498 14.2949C5.02498 13.5699 4.88501 12.7999 4.88501 11.9999C4.88501 11.1999 5.01998 10.4299 5.26498 9.7049L1.275 6.60986C0.46 8.22986 0 10.0599 0 11.9999C0 13.9399 0.46 15.7699 1.28 17.3899L5.26498 14.2949Z" fill="#FBBC05"/><path d="M12.0004 24.0001C15.2404 24.0001 17.9654 22.935 19.9454 21.095L16.0804 18.095C15.0054 18.82 13.6204 19.245 12.0004 19.245C8.8704 19.245 6.21537 17.135 5.2654 14.29L1.27539 17.385C3.25539 21.31 7.3104 24.0001 12.0004 24.0001Z" fill="#34A853"/></svg>"""
-                                ),
+                            google(
                                 cls="size-6",
                             ),
                             fh.Div(
@@ -885,22 +922,22 @@ def get_app():  # noqa: C901
                     fh.Button(
                         fh.P(
                             "Log In",
-                            id="login-button-text",
+                            id="login-btn-txt",
                             cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         spinner(
-                            id="login-loader",
+                            id="login-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
-                        id="login-button",
+                        id="login-btn",
                         type="submit",
                         cls=f"w-full {click_button} p-3 {rounded}",
                     ),
                     hx_post="/auth/login",
                     hx_target="this",
                     hx_swap="none",
-                    hx_indicator="#login-button-text, #login-loader",
-                    hx_disabled_elt="#email, #password, #login-button",
+                    hx_indicator="#login-btn-txt, #login-ldr",
+                    hx_disabled_elt="#email, #password, #login-btn",
                     cls="w-full",
                 ),
                 fh.Div(
@@ -943,22 +980,22 @@ def get_app():  # noqa: C901
                 fh.Button(
                     fh.P(
                         "Send Reset Link",
-                        id="forgot-password-button-text",
+                        id="forgot-pwd-btn-txt",
                         cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     spinner(
-                        id="forgot-password-loader",
+                        id="forgot-pwd-ldr",
                         cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
-                    id="forgot-password-button",
+                    id="forgot-pwd-btn",
                     type="submit",
                     cls=f"w-full {click_button} p-3 {rounded}",
                 ),
                 hx_post="/auth/forgot-password",
                 hx_target="this",
                 hx_swap="none",
-                hx_indicator="#forgot-password-button-text, #forgot-password-loader",
-                hx_disabled_elt="#email, #forgot-password-button",
+                hx_indicator="#forgot-pwd-btn-txt, #forgot-pwd-ldr",
+                hx_disabled_elt="#email, #forgot-pwd-btn",
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
             ),
             cls=f"{page_ctnt} justify-center items-center",
@@ -1009,22 +1046,22 @@ def get_app():  # noqa: C901
                 fh.Button(
                     fh.P(
                         "Reset Password",
-                        id="reset-password-button-text",
+                        id="reset-pwd-btn-txt",
                         cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     spinner(
-                        id="reset-password-loader",
+                        id="reset-pwd-ldr",
                         cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
-                    id="reset-password-button",
+                    id="reset-pwd-btn",
                     type="submit",
                     cls=f"w-full {click_button} p-3 {rounded}",
                 ),
                 hx_post="/auth/reset-password",
                 hx_target="this",
                 hx_swap="none",
-                hx_indicator="#reset-password-button-text, #reset-password-loader",
-                hx_disabled_elt="#password, #confirm_password, #reset-password-button",
+                hx_indicator="#reset-pwd-btn-txt, #reset-pwd-ldr",
+                hx_disabled_elt="#password, #confirm_password, #reset-pwd-btn",
                 cls=f"w-full md:w-1/3 flex flex-col justify-center items-center gap-4 {input_cls} p-8",
             ),
             cls=f"{page_ctnt} justify-center items-center",
@@ -1039,7 +1076,13 @@ def get_app():  # noqa: C901
                 fh.Div(
                     num_trials(session),
                     trial_manage(session),
-                    get_trial_table_part(session),
+                    fh.Table(
+                        fh.Tbody(
+                            get_trial_table_part(session),
+                        ),
+                        id="trial-table",
+                        cls=f"w-full flex justify-center items-center {input_cls} p-4",
+                    ),
                     trial_load_more(session),
                     cls="w-full flex flex-col justify-center items-center gap-4",
                 ),
@@ -1098,18 +1141,18 @@ def get_app():  # noqa: C901
                             fh.Button(
                                 fh.P(
                                     "Edit",
-                                    id="edit-button-text",
+                                    id="edit-btn-txt",
                                     cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                                 ),
                                 spinner(
-                                    id="edit-loader",
+                                    id="edit-ldr",
                                     cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                                 ),
                                 hx_get="/user/settings/edit",
                                 hx_target="#settings",
                                 hx_swap="outerHTML",
-                                hx_indicator="#edit-button-text, #edit-loader",
-                                hx_disabled_elt="#edit-button",
+                                hx_indicator="#edit-btn-txt, #edit-ldr",
+                                hx_disabled_elt="#edit-btn",
                                 cls=f"max-w-28 md:max-w-48 flex grow justify-center items-center {click_button} {rounded} p-3",
                             ),
                             cls="w-full flex justify-between items-center",
@@ -1159,17 +1202,17 @@ def get_app():  # noqa: C901
                     fh.Button(
                         fh.P(
                             "Delete Account",
-                            id="delete-account-button-text",
+                            id="del-account-btn-txt",
                             cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         spinner(
-                            id="delete-account-loader",
+                            id="del-account-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         hx_delete="/user/settings/delete-account",
                         hx_confirm="Are you sure you want to delete your account? This action cannot be undone.",
-                        hx_indicator="#delete-account-button-text, #delete-account-loader",
-                        hx_disabled_elt="#delete-account-button",
+                        hx_indicator="#del-account-btn-txt, #del-account-ldr",
+                        hx_disabled_elt="#del-account-btn",
                         cls=f"w-full flex justify-center items-center {click_danger_button} {rounded} p-3",
                     ),
                     cls="w-full flex flex-col justify-center items-center gap-4",
@@ -1262,22 +1305,21 @@ def get_app():  # noqa: C901
                     shown_trials[uuid] = curr_state
                     yield f"""event: UpdateTrials\ndata: {fh.to_xml(
                     spinner(
-                            id=f"trial-{trial.uuid}-main-loader",
-                            sse_swap="UpdateTrials",
+                            id=f"trials-{trial.uuid}-status",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
+                            sse_swap="UpdateTrials",
                     ) if curr_state == "loading" else
-                    fh.Div(
-                        fh.Svg(
-                            fh.NotStr(
-                                """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" /></svg>"""
-                            ),
-                            cls=f"size-6 text-{error_color} hover:text-{error_hover_color}",
-                        ),
+                    cross(
+                        id=f"trials-{trial.uuid}-status",
+                        cls=f"size-6 text-{error_color} hover:text-{error_hover_color}",
                         sse_swap="UpdateTrials",
                     ) if curr_state == "failed" else
-                    fh.Div(
+                    checkmark(
+                        id=f"trials-{trial.uuid}-status",
+                        cls=f"size-6 text-{click_color} hover:text-{click_hover_color}",
                         sse_swap="UpdateTrials",
-                    ))}\n\n"""
+                    )
+                    )}\n\n"""
             await sleep(1)
 
     def validate_image_base64(image_base64: str) -> dict[str, str]:
@@ -1559,17 +1601,17 @@ def get_app():  # noqa: C901
                 fh.Button(
                     fh.P(
                         "Log out",
-                        id="logout-button-text",
+                        id="logout-btn-txt",
                         cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     spinner(
-                        id="logout-loader",
+                        id="logout-ldr",
                         cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                     ),
                     cls=f"w-full {click_button} {rounded} p-3",
                     hx_get="/auth/logout",
-                    hx_indicator="#logout-button-text, #logout-loader",
-                    hx_disabled_elt="#logout-button",
+                    hx_indicator="#logout-btn-txt, #logout-ldr",
+                    hx_disabled_elt="#logout-btn",
                 ),
                 cls=f"absolute top-14 right-0 min-w-40 z-10 flex flex-col justify-center items-center gap-2 {input_cls} p-2",
             ),
@@ -1635,9 +1677,9 @@ def get_app():  # noqa: C901
                     fh.Button(
                         suggestion,
                         hx_post="/trial/modify-question",
-                        hx_target="#new-textarea-content",
-                        hx_indicator="#check-results, #modify-loader",
-                        hx_disabled_elt="#question-form-button",
+                        hx_target="#new-textarea-ctnt",
+                        hx_indicator="#check-results, #modify-ldr",
+                        hx_disabled_elt="#question-form-btn",
                         hx_vals=json.dumps(
                             {
                                 "question": question,
@@ -1690,111 +1732,133 @@ def get_app():  # noqa: C901
         trial = get_trial(session, uuid)
 
         # on fail
-        async def on_fail(trial: Trial):
-            with get_db_session() as db_session:
-                trial.success = False
-                db_session.add(trial)
-                db_session.commit()
-                db_session.refresh(trial)
-            await send(trial_expanded(trial))
-            await ws.close()
-            return
-
-        # create search parameters and search papers
-        await send(
-            section_view(sections[0], "running", f"section-{uuid}-0"),
-        )
-        search_params, papers = (
-            question_to_query_and_papers_threaded.local(trial.question)
-            if modal.is_local()
-            else question_to_query_and_papers_threaded.remote(trial.question)
-        )
-        status = "completed" if search_params and papers else "failed"
-        await send(
-            section_view(sections[0], status, f"section-{uuid}-0"),
-        )
-        if status == "completed":
-            with get_db_session() as db_session:
-                db_search_params = SearchParams(**search_params, trial=trial)
-                db_session.add(db_search_params)
-
-                db_papers = []
-                for paper in papers:
-                    paper = Paper(**paper)
-                    db_papers.append(paper)
-                db_session.add(trial)
-                trial.papers = db_papers
-
-                db_session.commit()
-                db_session.refresh(db_search_params)
-                db_session.refresh(trial)
-        else:
-            return await on_fail(trial)
-
-        # screen papers
-        await send(
-            section_view(sections[1], "running", f"section-{uuid}-1"),
-        )
-        papers = (
-            rerank_papers_threaded.local(trial.question, papers)
-            if modal.is_local()
-            else rerank_papers_threaded.remote(trial.question, papers)
-        )
-        status = "completed" if papers else "failed"
-        await send(
-            section_view(sections[1], status, f"section-{uuid}-1"),
-        )
-        if status == "completed":
-            with get_db_session() as db_session:
-                db_papers = []
-                for paper in papers:
-                    db_paper = Paper(**paper)
-                    db_papers.append(db_paper)
-                db_session.add(trial)
-                trial.papers = db_papers
-                db_session.commit()
-                db_session.refresh(trial)
-        else:
-            return await on_fail(trial)
-
-        # extract data points
-        await send(
-            section_view(sections[2], "running", f"section-{uuid}-2"),
-        )
-        data_points = (
-            extract_data_points_threaded.local(papers)
-            if modal.is_local()
-            else extract_data_points_threaded.remote(papers)
-        )
-        status = "completed" if data_points else "failed"
-        await send(
-            section_view(sections[2], status, f"section-{uuid}-2"),
-        )
-        if status == "completed":
-            with get_db_session() as db_session:
-                for paper, data_points in zip(papers, data_points):
-                    db_data_points = []
-                    for data_point in data_points:
-                        db_data_point = DataPoint(**data_point)
-                        db_data_points.append(db_data_point)
-                    db_session.add(paper)
-                    paper.data_points = db_data_points
-                db_session.add(trial)
-                trial.papers = papers
-                db_session.commit()
-                db_session.refresh(trial)
-        else:
-            return await on_fail(trial)
-
-        # success
-        with get_db_session() as db_session:
-            trial.success = True
-            db_session.add(trial)
+        async def on_fail():
+            trial.success = False
             db_session.commit()
             db_session.refresh(trial)
-        await send(trial_expanded(trial))
-        await ws.close()
-        return
+            return await send(trial_expanded(trial))
+
+        # for all steps below, skip if not failed OR step's result is already in db
+
+        ## create search parameters and search papers
+        with get_db_session() as db_session:
+            db_session.add(trial)
+            if trial.success is False or trial.search_params is None:
+                await send(
+                    section_view(sections[0], "running", f"section-{uuid}-0"),
+                )
+                search_params, papers = (
+                    question_to_query_and_papers_threaded.local(trial.question)
+                    if modal.is_local()
+                    else question_to_query_and_papers_threaded.remote(trial.question)
+                )
+                status = "completed" if search_params and papers else "failed"
+                await send(
+                    section_view(sections[0], status, f"section-{uuid}-0"),
+                )
+                if status == "completed":
+                    db_search_params = SearchParams(**search_params, trial=trial)
+                    db_session.add(db_search_params)
+                    db_session.commit()
+                    db_session.refresh(db_search_params)
+                else:
+                    return await on_fail()
+
+        # screen papers
+        with get_db_session() as db_session:
+            db_session.add(trial)
+            if trial.success is False or trial.papers is None:
+                await send(
+                    section_view(sections[1], "running", f"section-{uuid}-1"),
+                )
+                screened_papers = (
+                    screen_papers_threaded.local(papers)
+                    if modal.is_local()
+                    else screen_papers_threaded.remote(papers)
+                )
+                status = "completed" if screened_papers else "failed"
+                await send(
+                    section_view(sections[1], status, f"section-{uuid}-1"),
+                )
+                if status == "completed":
+                    db_papers = []
+                    for paper in screened_papers:
+                        db_paper = Paper(**paper)
+                        db_papers.append(db_paper)
+                    trial.papers = db_papers
+                    db_session.commit()
+                    db_session.refresh(trial)
+                else:
+                    return await on_fail()
+
+        # extract data points
+        with get_db_session() as db_session:
+            db_session.add(trial)
+            if trial.success is False or not trial.data_point_extract_complete:
+                await send(
+                    section_view(sections[2], "running", f"section-{uuid}-2"),
+                )
+                screened_papers = [paper.model_dump() for paper in trial.papers]
+                data_points = (
+                    extract_data_points_threaded.local(trial.question, screened_papers)
+                    if modal.is_local()
+                    else extract_data_points_threaded.remote(
+                        trial.question, screened_papers
+                    )
+                )
+                status = "completed" if data_points else "failed"
+                await send(
+                    section_view(sections[2], status, f"section-{uuid}-2"),
+                )
+                if status == "completed":
+                    db_papers = []
+                    for paper, data_points in zip(screened_papers, data_points):
+                        db_data_points = []
+                        for data_point in data_points:
+                            db_data_point = DataPoint(**data_point)
+                            db_data_points.append(db_data_point)
+                        db_paper = Paper(**paper)
+                        db_paper.data_points = db_data_points
+                        db_papers.append(db_paper)
+                    trial.papers = db_papers
+                    trial.data_point_extract_complete = True
+                    db_session.commit()
+                    db_session.refresh(trial)
+                else:
+                    return await on_fail()
+
+        # rerank papers and create visualization
+        with get_db_session() as db_session:
+            db_session.add(trial)
+            if trial.success is False or not trial.rerank_and_visualize_complete:
+                await send(
+                    section_view(sections[3], "running", f"section-{uuid}-3"),
+                )
+                screened_papers = [paper.model_dump() for paper in trial.papers]
+                reranked_papers, visualization = (
+                    rerank_and_visualize_papers_threaded.local(
+                        trial.question, screened_papers
+                    )
+                    if modal.is_local()
+                    else rerank_and_visualize_papers_threaded.remote(
+                        trial.question, screened_papers
+                    )
+                )
+                status = "completed" if reranked_papers else "failed"
+                await send(
+                    section_view(sections[3], status, f"section-{uuid}-3"),
+                )
+                if status == "completed":
+                    db_papers = [Paper(**paper) for paper in reranked_papers]
+                    trial.papers = db_papers
+                    trial.visualization = visualization
+                    trial.rerank_and_visualize_complete = True
+                    trial.success = True
+                    db_session.commit()
+                    db_session.refresh(trial)
+                    return await send(trial_expanded(trial))
+                else:
+                    return await on_fail()
 
     async def on_disconnect():
         pass
@@ -1811,8 +1875,8 @@ def get_app():  # noqa: C901
         )
 
     @f_app.get("/trials/page/{idx}")
-    def page_gens(session, idx: int):
-        part = get_trial_table_part(session, idx)  # to modify global shown_generations
+    def page_trials(session, idx: int):
+        part = get_trial_table_part(session, idx)  # to modify global shown_trials
         return part, trial_load_more(
             session,
             idx + 1,
@@ -1873,7 +1937,7 @@ def get_app():  # noqa: C901
                 ),
             )
         else:
-            fh.add_toast(session, "No generations selected.", "warning")
+            fh.add_toast(session, "No trials selected.", "warning")
             return fh.Response(status_code=204)
 
     @f_app.post("/trials/show-select-delete")
@@ -2115,7 +2179,7 @@ def get_app():  # noqa: C901
                             hx_target="#profile-img-preview",
                             hx_swap="outerHTML",
                             hx_trigger="change delay:200ms changed",
-                            hx_indicator="#profile-img-preview, #profile-img-loader",
+                            hx_indicator="#profile-img-preview, #profile-img-ldr",
                             hx_disabled_elt="#new-profile-img-upload",
                             hx_encoding="multipart/form-data",
                             cls="hidden",
@@ -2133,20 +2197,20 @@ def get_app():  # noqa: C901
                     fh.Button(
                         fh.P(
                             "Save",
-                            id="save-button-text",
+                            id="save-btn-txt",
                             cls=f"hide-when-loading text-{text_color} hover:text-{text_button_hover_color}",
                         ),
                         spinner(
-                            id="save-loader",
+                            id="save-ldr",
                             cls=f"indicator size-6 text-{text_color} hover:text-{text_button_hover_color}",
                         ),
-                        id="save-button",
+                        id="save-btn",
                         type="submit",
                         hx_patch="/user/settings/save",
                         hx_target="this",
                         hx_swap="none",
-                        hx_indicator="#save-button-text, #save-loader",
-                        hx_disabled_elt="#new-profile-img-upload, #email, #username, #password, #save-button",
+                        hx_indicator="#save-btn-txt, #save-ldr",
+                        hx_disabled_elt="#new-profile-img-upload, #email, #username, #password, #save-btn",
                         hx_include="#new-profile-img-upload",
                         hx_encoding="multipart/form-data",
                         cls=f"max-w-28 md:max-w-48 flex grow justify-center items-center {click_button} {rounded} p-3",
@@ -2370,8 +2434,8 @@ f_app = get_app()
 
 @app.function(
     image=FE_IMAGE,
-    cpu=CPU,
-    memory=MEM,
+    cpu=0.125,  # cores
+    memory=128,  # MB
     secrets=SECRETS,
     timeout=5 * MINUTES,
     scaledown_window=15 * MINUTES,
